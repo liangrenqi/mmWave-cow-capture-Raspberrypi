@@ -1,0 +1,17 @@
+--- a/Common/rf_api_internal.h
++++ b/Common/rf_api_internal.h
+@@ -256,4 +256,14 @@
+ }
+ #endif
+ 
++/* ARM64 fix: the #pragma pack(1) above is never closed in the original TI
++ * source, so it leaks into every file that includes this header --
++ * recorddatarecv.h, configdatarecv.h, etc. That packs the receiver classes
++ * byte-tight, placing their embedded pthread_cond_t / pthread_mutex_t on
++ * unaligned addresses. x86 tolerates unaligned atomics; aarch64 raises
++ * SIGBUS. Reset the packing at end-of-header so it stays scoped to the two
++ * internal structs defined here. The wire-protocol structs in rf_api.h have
++ * their own pack(1) and are unaffected. */
++#pragma pack()
++
+ #endif // RF_API_INTERNAL_H

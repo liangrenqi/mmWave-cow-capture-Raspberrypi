@@ -1,0 +1,26 @@
+--- a/RF_API/recorddatarecv.h
++++ b/RF_API/recorddatarecv.h
+@@ -76,7 +76,15 @@
+  * --> This is a Generic class for instantiation of different data ports index <!--
+  * --> as per the requirements.
+  */
+-class cUdpDataReceiver
++/* ARM64 fix: an unclosed #pragma pack(1) reaches this file through the
++ * include chain, giving this class alignof()==1. Its embedded
++ * OSAL_SIGNAL_HANDLE_TYPE members then land on unaligned addresses, and
++ * glibc aarch64 raises SIGBUS on the atomics inside pthread_cond_wait /
++ * pthread_mutex_lock. x86 tolerates unaligned atomics, which is why TI never
++ * hit this. This class is a pure in-memory object -- it is never sent over
++ * the wire -- so forcing 8-byte alignment is safe. */
++#pragma pack(push, 8)
++class __attribute__((aligned(8))) cUdpDataReceiver
+ {
+ 	/** Data type index										*/
+     UINT8 u8DataTypeId;
+@@ -307,5 +315,6 @@
+     void WriteOffsetMetaData(ULONG64 u64PrevPktOffset, UINT32 u32PrevPktSize,
+                                  ULONG64 u64CtPktOffset, UINT32 u32CtPktSize);
+ };
++#pragma pack(pop)
+ 
+ #endif //RECORDDATARECV_H

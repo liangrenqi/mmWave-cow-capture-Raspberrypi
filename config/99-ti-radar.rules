@@ -1,0 +1,7 @@
+# TI XDS110 debug probe (IWR6843 + MMWAVEICBOOST) exposes two CDC-ACM ports:
+#   ttyACM0 = radar CLI / config port, ttyACM1 = data port
+# ModemManager probes every new tty to see if it is a cellular modem. That both
+# holds the port open (~10 s, causing EBUSY in capture_linux.py) and writes
+# AT/QCDM probe bytes into the radar CLI. Tell MM to leave this device alone.
+# Reversible: delete this file + udevadm control --reload
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0451", ATTRS{idProduct}=="bef3", ENV{ID_MM_DEVICE_IGNORE}="1"

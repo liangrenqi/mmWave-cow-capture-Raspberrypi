@@ -1,0 +1,16 @@
+# 采集数据（GB 级，绝不入库）
+*.bin
+*.pcap
+data/
+!bin/*
+# 运行时产物
+__pycache__/
+*.pyc
+.last_chcfg
+CLI_LogFile.txt
+*_LogFile.csv
+*.bak.*
+*.orig
+# 编译中间产物（bin/ 里的成品是特意提交的）
+dca1000_src/Release/
+dca1000_src/**/*.o

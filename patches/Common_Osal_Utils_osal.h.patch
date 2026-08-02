@@ -1,0 +1,27 @@
+--- a/Common/Osal_Utils/osal.h
++++ b/Common/Osal_Utils/osal.h
+@@ -79,6 +79,14 @@
+ typedef SINT32 OSAL_SHM_HANDLE_TYPE;
+ 
+ /** Structure definition for event handle (Linux)       */
++/* ARM64 fix: globals.h has an unclosed #pragma pack(1), which strips the
++ * alignment requirement from pthread_cond_t / pthread_mutex_t. On x86 an
++ * unaligned atomic is merely slow; on aarch64 glibc uses __aarch64_ldadd8_acq
++ * on the condvar, which raises SIGBUS when the address is not 8-byte aligned.
++ * This struct never goes on the wire, so restore natural alignment for it
++ * only -- do NOT touch the protocol structs in rf_api.h, they must stay
++ * packed byte-exact for the FPGA to parse them. */
++#pragma pack(push, 8)
+ typedef struct
+ {
+     /** Condition variable handle  */
+@@ -89,7 +97,8 @@
+ 
+     /** Signalled state flag       */
+     bool bSignalled;
+-}OSAL_SIGNAL_HANDLE_TYPE;
++} __attribute__((aligned(8))) OSAL_SIGNAL_HANDLE_TYPE;
++#pragma pack(pop)
+ 
+ #endif
+ 
