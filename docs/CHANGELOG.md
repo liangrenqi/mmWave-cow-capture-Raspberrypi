@@ -6,6 +6,161 @@
 
 ---
 
+## 2026-09-06
+
+### 遥控采集 + 语音提示 + 开机自启（已实测通过）
+
+封盒后饲养员不碰电脑、不需要屏幕：上电即待命，全程遥控器 + 语音。
+
+**两层遥控**（分工不要混）：
+
+```
+remote_daemon.py（开机自启，永不退出，独占 event7）
+    POWER × 2  →  启动 / 退出 capture_linux.py --remote
+
+capture_linux.py --remote（子进程，独占 event8/9）
+    ENTER × 2  →  采一段
+    ESC        →  紧急中止本段
+```
+
+新增 `scripts/remote_control.py`（按键状态机 + 音频后端）、
+`scripts/remote_daemon.py`（守护进程）、`config/radar-remote.service`、
+四个自检脚本、`sounds/` 下 11 个 wav。
+`capture_linux.py` 改 8 处，**采集时序（fpga→record→start_record→cfg→stop）
+一字未动** —— 七项判据的基础不能碰。
+
+### ★ 修掉原 Ctrl-C 路径的两个真 bug
+
+这两条在加遥控之前就存在，是"提前中止"这个需求把它们暴露出来的。
+
+**1. 不发 `sensorStop`，雷达根本不停。**
+原路径只发 `stop_record`，而那是对 **DCA1000** 说的 —— 雷达完全不知情，
+按 cfg 帧数继续发射到跑完。妊娠 54000 帧那种配置，第 1 分钟中止的话
+雷达还要**空转 44 分钟**，真正停它的是下次采集开头 cfg 里那句 `sensorStop`。
+这段空转还会全部计进阶段 7 要测的功耗。
+（`check_field_limits` 的注释里早写明了这个行为，只是此前没有中止需求。）
+
+**2. 不归档，游离文件卡死下次采集 ★ 更严重。**
+`_Raw_*.bin` / `.pcap` / `.csv` 留在落盘根目录 → **下次采集被残留检查
+挡回并 return False**。牛场里就是"饲养员按了停止，之后按开始永远无声失败"，
+而封盒后没屏幕看不到那条报错。
+2026-08-06 帧数回绕那次实测踩到过（当时记录："手动 Ctrl-C 收场，
+留下三个游离文件没归档"）。
+
+现在 **Ctrl-C 与 ESC 走同一个 `abort_capture()`**：
+发 `sensorStop` → 等 3 秒 → `stop_record` → 停 tcpdump → 清进程 →
+归档到 `ABORT_Cow_*` → 写 `verdict=ABORTED` 的精简 meta（不跑 L3/RX）。
+`capture()` 的 except 也从 `except Exception` 扩到含 `KeyboardInterrupt`
+—— 准备阶段（起 tcpdump / 发 cfg）按 Ctrl-C 同样会留下文件和进程，
+`_run` 里那个倒计时的 except 覆盖不到。
+
+**数据是移走归档不是删除**，沿用"判废也只加前缀、数据保留不删"的既有规则。
+
+### ★ `User=root` 会静默毁掉 pcap（unit 的最大坑）
+
+第一版 unit 写了 `User=root`，两条都栽：
+
+1. **evdev 装在 pi 的用户目录里，root 看不见**
+   （`/home/pi/.local/lib/python3.11/site-packages/evdev/`，
+   是 pip 用户级安装，`dpkg -l python3-evdev` 查不到）。
+   实测服务崩溃重启 **30 次**，日志全是 `ModuleNotFoundError`。
+2. **`PCAP_USER` 会解析成 root** —— `capture_linux.py:90` 是
+   `SUDO_USER or USER or "pi"`，以 root 直接运行时没有 `SUDO_USER`、
+   `USER=root` ⇒ `tcpdump -Z root`。而 exFAT 挂载按 `uid=1000` 固定，
+   实测 **`-Z root` 写出 0 个包、24 字节空 pcap，退出码仍是 0**
+   —— 采完 45 分钟才发现全废。
+
+改成 `User=pi` + `SupplementaryGroups=input audio dialout …`
+（不写附加组的话 systemd 只给主组，恰好丢掉这三个）。
+权限够用已逐条验证：脚本里用到的三处 sudo（`sysctl`/`tcpdump`/`kill`）
+`sudo -n` 非交互免密全部 OK。
+
+### `StartLimitIntervalSec` 属于 `[Unit]` 不属于 `[Service]`
+
+放错段会被**静默忽略**（`systemd-analyze verify` 报
+`Unknown key ... ignoring`）⇒ 重启限流失效，崩溃时无限重启。
+修正后验证被识别：`StartLimitIntervalUSec=2min` / `StartLimitBurst=5`。
+**养成习惯：装 unit 后必跑 `systemd-analyze verify`。**
+
+### ⚠ POWER 键默认会让 systemd 关机
+
+`HandlePowerKey` 的 systemd 默认值是 `poweroff`，而系统自带 udev 规则
+（`/usr/lib/udev/rules.d/70-power-switch.rules`）给**所有** `ID_INPUT_KEY=1`
+的设备打 `power-switch` 标签 —— 实测 event0/1/3/7/8/9 **六个节点全部**
+在 logind 监听范围内。
+
+手动测试时没关机是**侥幸**：靠桌面会话挂的一把
+`handle-power-key block` 锁（`gtk-nop`）挡着。那把锁在命令行启动、
+桌面崩溃、或本服务比桌面先起来时都不存在。
+
+已装 `/etc/systemd/logind.conf.d/99-radar-remote.conf` 置 `ignore`。
+**副作用：Pi 板载电源按钮短按也不再关机**，关机改用 `sudo poweroff`。
+`systemd-logind` 不支持 reload（实测 `CanReload=no`），需重启生效。
+
+### ★ evdev 读事件**不消费**它 —— 必须 grab() 独占
+
+内核会把同一次按键**同时**投递给 evdev 客户端**和**常规键盘处理器。
+不独占时遥控器仍是普通键盘：
+- 现象：按开始键，**SSH 终端里冒出 `ss` 字符**
+- 真实风险：`ENTER` 会在活动控制台上"回车"，而实测 **tty1 上正跑着
+  `login` + `bash`** ⇒ 等于往那个 shell 里敲回车。封盒后无人能发现。
+
+已改为**默认独占**（`--no-grab` / `--no-grab-capture` 可关）。
+
+### 设备筛选：capabilities ≠ 实际按键
+
+`event9` 的 capabilities 里**有 KEY_S、KEY_E、甚至 KEY_POWER** ——
+整套 163 键都在。那只是 HID 描述符声明的**能力上限**。
+照它猜键位的后果是"按遍所有按钮都没反应"且不报错。
+
+同一坑更危险的一面：守护进程原本筛"能报 KEY_POWER"的节点，结果
+**event1/3（HDMI CEC）、event8、event9 全部命中**，而它会 grab 独占 ——
+**一旦独占 event9，采集程序就再也收不到 ENTER/ESC**。
+现有三条排除规则：排除能报 ENTER/ESC 的、排除 `pwr_button`、排除 `hdmi`。
+修好后只剩 event7，与实测一致。
+
+### 状态文件判据用 PID 比对，不能用时间戳
+
+守护进程靠采集程序写的状态文件决定"能不能退出"（只有 IDLE 放行）。
+第一版用"时间戳超 300 秒即陈旧"，**是错的**：
+**IDLE 可以持续几小时不变，而它恰恰是唯一允许退出的状态** ⇒
+待命久了反而永远退不出去；CAPTURING 在 45 分钟采集里也是 2700 秒不变。
+改为文件里记 PID，与当前子进程不符才算遗留。
+
+`set_state()` 同时改成**仅状态变化时才写盘** —— `_remote_loop` 每秒
+`set_state(IDLE)` 一次（为让 Ctrl-C 及时响应），无条件写就是每秒一次
+SD 卡写入，长期待命纯属无谓磨损。
+
+### 按键参数：MIN_GAP 150 → 50 ms
+
+实测人为"快速连按"的间隔是 **209 ms**，离原设的 150 ms 只差 59 ms
+—— 再快一点第二次就被当成抖动丢掉，**双击不成立且没有任何提示**，
+现象是"按两下没反应"。
+敢降的依据：同一次实测里 5 次按键**全部来自 event5**（旧键盘）、
+另一节点零事件 ⇒ 跨节点重复并不存在。真发生也是同一批 USB 传输、
+间隔在毫秒级，50 ms 照样拦得住，而人手连按远在其上。
+
+区分"跨节点重复"与"人为连按"不能只看间隔，要同时看三样：
+**是否同一节点、中间有没有抬起、间隔量级**。
+
+### 语音：USB 声卡按名字选，两处必需的时序间隔
+
+固定 `plughw:CARD=Device`（名字取自 `/proc/asound/cards` 方括号内）。
+不给 `-D` 会落到 card 0 的 HDMI 上，**没声音且不报错**；
+card 号随插拔顺序变，名字不变；`plughw` 而非 `hw` 以便自动重采样。
+
+- **`preparing` 必须有声**（"采集命令下发"）：双击到 `start` 之间要跑
+  preflight、配 FPGA、起进程、发 29 条 cfg、等 `sensorStart`，实测
+  **10–20 秒**。用户实测反馈"中间没语音会让人以为没按上而继续按"。
+- **`done_*` 与 `ready` 之间加 1.5 秒**：原本只隔三行 print（< 0.1 s），
+  换成真播放器后 `done_good` 会被吞掉或与 `ready` 叠音。
+
+播放实现三个约束：独立线程串行播（`aplay` 阻塞，会卡住采集时序；
+两个 aplay 抢同一声卡第二个会失败）、队列超 3 个丢最旧（免得提示音
+滞后于状态）、失败只打警告（喇叭掉线/wav 缺失都不影响采集）。
+
+---
+
 ## 2026-08-02
 
 ### 阶段 6 通过：行为满测 2.2 GB 六项判据零失败

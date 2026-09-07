@@ -1,0 +1,104 @@
+[Unit]
+# 遥控守护进程 —— 开机常驻，POWER 键双击启停采集程序
+#
+# 安装：
+#   sudo cp config/radar-remote.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now radar-remote
+#
+# 查看：
+#   systemctl status radar-remote
+#   journalctl -u radar-remote -f          # 实时日志（等价于前台输出）
+#
+# 停用：
+#   sudo systemctl disable --now radar-remote
+#
+# ★ 装之前必须先配 logind，否则 POWER 键会关机：
+#   sudo mkdir -p /etc/systemd/logind.conf.d
+#   sudo tee /etc/systemd/logind.conf.d/99-radar-remote.conf <<'EOF'
+#   [Login]
+#   HandlePowerKey=ignore
+#   HandlePowerKeyLongPress=ignore
+#   EOF
+#   sudo systemctl restart systemd-logind
+#
+Description=mmWave radar remote-control daemon (POWER key starts/stops capture)
+Documentation=https://github.com/liangrenqi/mmWave-cow-capture-Raspberrypi
+
+# 等网络与本地文件系统就绪。采集要求 eth0 有 192.168.33.30、
+# 落盘目录 /mnt/pssd 已挂载 —— 但守护进程本身不需要这些，
+# 只有它拉起的采集程序才需要，而那时人已经按了 POWER。
+# 故这里只做弱依赖，不阻塞开机。
+After=network.target local-fs.target sound.target systemd-logind.service
+Wants=network.target
+
+# 重启限流必须放在 [Unit] 而不是 [Service] ——
+# systemd-analyze verify 报了 "Unknown key 'StartLimitIntervalSec' in
+# section [Service], ignoring"。放错段会被**静默忽略**，
+# 于是限流失效、崩溃时可能陷入疯狂重启循环。
+# 语义：120 秒内最多重启 5 次，超了就停下不再重试。
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+[Service]
+Type=simple
+
+# ★ 必须以 pi 运行，不能用 root。两个各自独立的理由：
+#
+# 1. **evdev 装在 pi 的用户目录里**，root 看不见：
+#        pi   -> /home/pi/.local/lib/python3.11/site-packages/evdev/
+#        root -> ModuleNotFoundError: No module named 'evdev'
+#    （是 pip 用户级安装，不是 apt 的 python3-evdev，dpkg 查不到）
+#    实测 User=root 时服务崩溃重启 30 次，日志全是这条。
+#
+# 2. ★ **root 会静默毁掉 pcap**，这条比第 1 条严重得多：
+#    capture_linux.py 用 `SUDO_USER or USER or "pi"` 决定 tcpdump -Z 的降权
+#    目标。以 root 直接运行时没有 SUDO_USER、USER=root，于是变成 -Z root。
+#    而 exFAT 挂载按 uid=1000 固定，实测 `-Z root` 写出 **0 个包、24 字节
+#    空 pcap，退出码仍是 0** —— 采完 45 分钟才发现全废。
+#    （见 memory linux-capture-env-pitfalls：exFAT 上 -Z root 无效反直觉）
+#
+# 权限够不够：脚本内部对需要提权的三件事单独调 sudo（sysctl / tcpdump /
+# kill），已逐条验证 pi 免密非交互可用（sudo -n）。
+# pi 还在 input(102) 组能读 /dev/input/event*、audio(29) 组能用 USB 喇叭、
+# dialout(20) 组能开 /dev/ttyACM0 —— 三样都不需要 root。
+User=pi
+Group=pi
+# 补齐 pi 的全部附加组（docker/gpio/spi 等）。不加这条 systemd 只给主组，
+# 会丢掉 input/audio/dialout，那正是我们需要的三个。
+SupplementaryGroups=input audio dialout video plugdev netdev
+
+WorkingDirectory=/home/pi/mmwave-cow-capture/scripts
+ExecStart=/usr/bin/python3 /home/pi/mmwave-cow-capture/scripts/remote_daemon.py
+
+# SIGINT 而非默认的 SIGTERM：remote_daemon 的主循环把 SIGTERM 也接住了，
+# 但 SIGINT 走的是与 Ctrl-C 完全相同的那条已验证路径。
+KillSignal=SIGINT
+
+# 给足优雅退出的时间：采集程序中止一段要发 sensorStop、等在途数据落地、
+# 停 tcpdump、归档 —— 实测约 10 秒，守护进程自己等 45 秒，
+# 这里给 90 秒确保 systemd 不会中途 SIGKILL 打断归档。
+TimeoutStopSec=90
+
+# 整个进程组一起收，否则 tcpdump / CLI_Record 会变成孤儿进程
+KillMode=control-group
+
+# 崩了自动重启（限流参数在 [Unit] 段，见上方说明）
+Restart=on-failure
+RestartSec=5
+
+# 日志直接进 journal，用 journalctl -u radar-remote 看
+StandardOutput=journal
+StandardError=journal
+
+# Python 的 stdout 默认在非 tty 下是块缓冲的，日志会延迟几十秒才出现，
+# 排查时以为程序卡住了。设成 1 强制行缓冲。
+Environment=PYTHONUNBUFFERED=1
+
+# 音频设备：root 也需要能访问 USB 声卡。
+# 这两条是给将来可能加的 PrivateDevices= 之类的沙箱选项留的记号 ——
+# 现在没加任何沙箱限制，因为采集需要 /dev/ttyACM0、原始套接字、
+# System V 共享内存，加了反而处处踩坑。
+
+[Install]
+WantedBy=multi-user.target

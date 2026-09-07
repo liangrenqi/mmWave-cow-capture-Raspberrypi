@@ -16,6 +16,19 @@ sudo usermod -aG dialout $USER      # 串口权限，需重新登录
 
 不需要 numpy（`array.array` 已足够快，3.93 亿 int16 重排约 6 秒）。
 
+遥控采集额外需要 evdev 与 ALSA 工具（不用遥控功能可跳过）：
+
+```bash
+sudo apt install python3-evdev alsa-utils
+sudo usermod -aG input,audio $USER  # 读 /dev/input/event*、用 USB 喇叭
+```
+
+**装 evdev 优先用 apt 而不是 `pip install --user`。**
+pip 用户级安装会落到 `~/.local/lib/python3.11/site-packages/`，
+只有该用户可见 —— 若 systemd unit 里写了别的 `User=`，会
+`ModuleNotFoundError` 且服务无限重启（本项目实测踩过，见 CHANGELOG）。
+本机当前就是 pip 装的，故 unit 必须 `User=pi`。
+
 ---
 
 ## 1. 编译 TI CLI
@@ -186,6 +199,7 @@ python3 scripts/probe_radar.py
 | 5 | 生命体征满测（6000 帧） | 六项判据 PASS |
 | 5.5 | 行为 cfg 能否 sensorStart | `send_cfg_only.py` 31 条全 Done |
 | 6 | 行为满测（3000 帧） | 六项判据 PASS |
+| 6.5 | 遥控 + 语音 + 开机自启 | 见第 7 步，四项实测 |
 | 7 | 功耗与温度 | 待做 |
 
 阶段 4 用短配置先跑通链路：把 cfg 的 `frameCfg` 第 4 字段和 json 的
@@ -197,7 +211,129 @@ python3 scripts/probe_radar.py
 
 ---
 
-## 7. 常见部署问题
+## 7. 遥控采集与开机自启
+
+封盒后饲养员不碰电脑，全程遥控器 + 语音。**装之前先跑通阶段 1-6。**
+
+### 7.1 ⚠ 先屏蔽 POWER 键的关机功能（这一步不能跳）
+
+`HandlePowerKey` 的 systemd 默认值是 **`poweroff`**，而系统自带 udev 规则
+（`/usr/lib/udev/rules.d/70-power-switch.rules`）给**所有** `ID_INPUT_KEY=1`
+的输入设备打 `power-switch` 标签，不区分来源。
+实测遥控器的 event7 与板载 event0 **都在 logind 监听范围内** ——
+不处理的话按两下 POWER 就把 Pi 关机，正在进行的采集全废。
+
+```bash
+sudo mkdir -p /etc/systemd/logind.conf.d
+sudo tee /etc/systemd/logind.conf.d/99-radar-remote.conf <<'EOF'
+[Login]
+HandlePowerKey=ignore
+HandlePowerKeyLongPress=ignore
+EOF
+```
+
+**判据**（需重启后才生效，`systemd-logind` 实测 `CanReload=no`）：
+
+```bash
+sudo systemd-analyze cat-config systemd/logind.conf | grep HandlePowerKey
+#   应为 ignore
+```
+
+别指望桌面会话那把 `handle-power-key block` 锁 —— 它在命令行启动、
+桌面崩溃、或本服务比桌面先起来时都不存在。
+
+**副作用**：Pi 板载电源按钮短按也不再关机，改用 `sudo poweroff`。
+桌面菜单的关机走 D-Bus，不受影响。
+
+### 7.2 测出遥控器按钮的实际键码
+
+**HID 声明的"能报哪些键"不等于按钮实际发什么码。**
+本项目用的 Genius 演示器（`27a7:2501`），其 event9 的 capabilities 里有
+整套 163 个键（含 KEY_S / KEY_E / 甚至 KEY_POWER），但按钮只发几个。
+照 capabilities 猜的后果是"按遍所有按钮都没反应"且不报错。
+
+```bash
+python3 scripts/_test_input_monitor.py      # 逐个按，看实际键名与来源节点
+python3 scripts/_test_remote_keys.py        # 验证双击、去抖、长按忽略
+```
+
+本项目实测结果（换遥控器需重测）：
+
+| 物理按钮 | 键码 | 节点 | 用途 |
+|---|---|---|---|
+| 电源 | `KEY_POWER` | event7 | 启停采集程序 |
+| 确认 | `KEY_ENTER` | event9 | 开始采集（双击） |
+| 返回 | `KEY_ESC` | event9 | 紧急中止 |
+
+键位改动处：`scripts/remote_control.py` 的 `START_KEY` / `STOP_KEY`，
+`scripts/remote_daemon.py` 的 `POWER_KEY`（填 `KEY_` 之后的部分，小写）。
+
+### 7.3 音频
+
+```bash
+cat /proc/asound/cards        # 方括号里的名字才是 CARD= 要填的
+python3 scripts/_test_audio.py --gen        # 生成 11 个占位音（纯合成）
+python3 scripts/_test_audio.py              # 按实际顺序播一遍，验证喇叭
+```
+
+**设备必须按名字选不按编号** —— 代码固定 `plughw:CARD=Device`。
+不给 `-D` 会落到 card 0 的 HDMI 上，**没声音且不报错**；
+而 card 号随插拔顺序变（HDMI 插不插、换 USB 口都可能变），名字不变。
+换了别的喇叭改 `remote_control.AudioNotifier.DEVICE`。
+
+wav 放 `sounds/`，**文件名即内容**，换真人语音同名覆盖即可，
+代码不用改（16-bit PCM / 44.1 kHz / 单声道）。
+
+### 7.4 装服务
+
+```bash
+sudo cp config/radar-remote.service /etc/systemd/system/
+sudo systemctl daemon-reload
+systemd-analyze verify /etc/systemd/system/radar-remote.service   # ★ 必做
+sudo systemctl enable radar-remote        # 只需一次，永久生效
+sudo reboot                               # 顺带让 7.1 的 logind 配置生效
+```
+
+`systemd-analyze verify` 那步别省 —— **放错段的键会被静默忽略**。
+本项目实测把 `StartLimitIntervalSec` 写进 `[Service]`（它属于 `[Unit]`），
+结果重启限流失效、崩溃时无限重启，就是靠这条命令发现的。
+
+**unit 里 `User=pi` 不能改成 root**，两个独立理由：
+
+1. evdev 是 pip 用户级安装，root 看不见 → `ModuleNotFoundError`，
+   实测服务崩溃重启 30 次
+2. ★ `capture_linux.py` 用 `SUDO_USER or USER or "pi"` 决定 `tcpdump -Z`
+   的降权目标。以 root 直接运行 ⇒ `-Z root`，而 exFAT 挂载按 `uid=1000`
+   固定，实测 **写出 0 个包、24 字节空 pcap，退出码仍是 0**
+
+权限够用（已逐条验证）：脚本对需提权的三件事单独调 sudo
+（`sysctl` / `tcpdump` / `kill`），`sudo -n` 非交互免密全部可用；
+`pi` 在 `input(102)` 读 event、`audio(29)` 用喇叭、`dialout(20)` 开串口。
+unit 必须显式写 `SupplementaryGroups=input audio dialout …`，
+否则 systemd 只给主组，恰好丢掉这三个。
+
+### 7.5 判据（四项，全部实测）
+
+重启后**不敲任何命令**：
+
+- [ ] 听到"设备就绪" ← 自启成功
+- [ ] `POWER` × 2 → "采集程序启动" → `ENTER` × 2 → "采集命令下发" →
+      （10-20 秒）→ "采集开始" → 采完 → "通过"
+- [ ] 采集中按 `ENTER` 被锁定（防误触）、按 `POWER` 被拒绝（播"忙"）
+- [ ] 采集中按 `ESC` → 中止并归档到 `ABORT_` 目录，
+      **之后立刻还能重新开始**（验证游离文件没卡住下次采集）
+
+```bash
+systemctl is-active radar-remote        # active
+python3 scripts/remote_daemon.py --check   # 设备 + logind + 音频一次查完
+```
+
+最后那项判据最关键：原 Ctrl-C 路径不归档，游离文件会留在落盘根目录
+导致下次采集被残留检查挡死 —— 封盒后没屏幕，现象就是"遥控器坏了"。
+
+---
+
+## 8. 常见部署问题
 
 | 症状 | 原因 |
 |---|---|
@@ -207,7 +343,12 @@ python3 scripts/probe_radar.py
 | ping DCA1000 不通 | 正常，卡不响应 ICMP |
 | 串口 permission denied | 用户不在 `dialout` 组，且需重新登录 |
 | `Errno 16 busy` | ModemManager 抢了，见第 3 步 |
-| pcap 只有 24 字节 | exFAT + tcpdump 降权，需 `-Z` |
+| pcap 只有 24 字节 | exFAT + tcpdump 降权，需 `-Z`；服务跑成 root 也会 |
 | 采集报"落盘目录不存在" | CLI 不自动创建，先 mkdir |
+| 按遥控器没反应 | 键码没实测、守护进程没跑、或两进程抢设备 |
+| 按键在终端里回显字符 | 没 grab 独占（evdev 读事件不消费它） |
+| 按两下 POWER 关机了 | 7.1 没做 |
+| 服务无限重启 | `User=root` 找不到 evdev，或限流键放错段 |
+| 没声音 | 落到 HDMI 上了，须 `plughw:CARD=<名字>` |
 
 更多见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。

@@ -394,3 +394,216 @@ RX 通道检测：**0.85 秒**（抽样约 4000 chirp，每通道百万级样本
 
 **exFAT 风险（未验证，仅提示）**：无日志，牛场电池供电下异常掉电
 可能损坏文件系统。若盘只在 Pi 上用，格 ext4 更安全，且不再需要 `-Z`。
+
+---
+
+## 九、遥控与语音
+
+### 为什么必须用 evdev，不能读 stdin
+
+封盒后没有终端、程序由 systemd 后台启动，**无线键盘的按键不会进到一个
+没有终端焦点的进程**。evdev 读 `/dev/input/event*`，走内核输入子系统，
+与终端焦点无关。
+
+反向也成立，且是个有用性质：**SSH / VNC 里打字不产生 evdev 事件**
+（字符走 SSH 通道进 shell，Pi 的输入子系统里什么都没发生）。
+所以别人在电脑上敲键盘不可能误触发采集。
+排查"按了收不到"时先问：按的是插在 Pi 上的那个遥控器吗。
+
+### ★ HID capabilities ≠ 实际按键
+
+`event9`（Genius 遥控的键盘接口）的 capabilities 里有**整套 163 个键**，
+含 `KEY_S` / `KEY_E` / 甚至 `KEY_POWER`。那只是 HID 描述符声明的
+**能力上限**，不代表按钮真的发这些码。
+
+实测该遥控的键分布：
+
+```
+event6  Genius Wireless Device                    5 键   BTN_*（鼠标）
+event7  Genius ... System Control                 3 键   KEY_POWER / SLEEP / WAKEUP
+event8  Genius ... Consumer Control             155 键   音量键等
+event9  Genius Wireless Device                  163 键   ENTER / ESC / 方向键…
+```
+
+按 capabilities 猜键位的后果是"按遍所有按钮都没反应"且不报错。
+**必须用 `_test_input_monitor.py` 逐个按、看实际输出。**
+
+同一坑更危险的一面：守护进程原本筛"能报 `KEY_POWER`"的节点，结果
+**event1/3（HDMI CEC）、event8、event9 全部命中** —— 而它会 `grab()` 独占，
+**一旦独占 event9，采集程序就再也收不到 ENTER/ESC，遥控彻底失灵且不报错**。
+故 `PowerWatcher.find_devices()` 有三条排除规则：排除能报 ENTER/ESC 的
+（那是子进程地盘）、排除 `pwr_button`、排除 `hdmi`。修好后只剩 event7。
+
+### ★ evdev 读事件不消费它 —— 必须 grab() 独占
+
+内核把同一次按键**同时**投递给 evdev 客户端**和**常规键盘处理器。
+不独占时遥控器仍是个普通键盘：
+
+- 现象：按开始键，SSH 终端里冒出 `ss` 字符
+- 真实风险：`ENTER` 会在**活动控制台**上"回车"，而实测 tty1 上正跑着
+  `login` + `bash` ⇒ 等于往那个 shell 里敲回车。封盒后无人能发现
+
+`grab()` 之后按键只到我们的程序。实测 `event9.grab()` / `ungrab()` 均成功。
+
+### 按键判定的三个要点
+
+**只认 `EV_KEY value==1`。** `value` 语义：`0`=抬起 `1`=按下 `2`=长按自动重复。
+实测按住两秒产生 **56 个 `value==2`**；不忽略的话按住不放会被当成连击、
+直接触发采集，防误触就白做了。
+
+**`MIN_GAP = 50 ms` 去抖。** 原设 150 ms，但实测人为"快速连按"的间隔是
+**209 ms**，只差 59 ms —— 再快一点第二次就被丢掉，**双击不成立且没有
+任何提示**，现象是"按两下没反应"。
+敢降的依据：实测同一批按键**全部来自单一节点**，跨节点重复并不存在；
+真发生也是同一批 USB 传输、间隔在毫秒级，50 ms 照样拦得住。
+
+**区分"跨节点重复"与"人为连按"不能只看间隔**，要同时看三样：
+
+| | 跨节点重复 | 人为连按 |
+|---|---|---|
+| 来源节点 | 不同 | 相同 |
+| 中间有无抬起 | **无** | **有** |
+| 间隔 | 毫秒级 | 百毫秒以上 |
+
+### 两层遥控与状态机
+
+```
+IDLE ─[ENTER×2]→ PREPARING → CAPTURING ─┬[自然采完]→ FINALIZING → IDLE
+                                         └[ESC]─────→ ABORTING ───┘
+```
+
+`PREPARING` / `CAPTURING` / `FINALIZING` / `ABORTING` 四态下**开始键一律忽略**
+（这就是"锁住开始键防误触"）。`ESC` 只在前两态有效；
+**`PREPARING` 期间按 `ESC` 是挂起**，进 `CAPTURING` 后立刻执行 —— 因为
+准备阶段 tcpdump / CLI_Record / 串口是逐个起来的，即时中止要为每个
+"起没起"写清理分支，而挂起可复用同一条 abort 路径，代价只是最多多等 20 秒。
+
+上层守护进程（`remote_daemon.py`）用 `KEY_POWER` 双击启停整个采集程序，
+与 ENTER/ESC 分属不同 event 节点、互不干扰。
+
+### 提前中止的时序（`abort_capture()`）
+
+```
+1. 发 sensorStop          ← 原 Ctrl-C 路径完全缺失的一步
+2. 等 3 秒（ABORT_SETTLE_SEC，比 BUFFER_SEC=10 短，中止数据本不指望用）
+3. stop_record → 停 tcpdump → kill_record_proc → cleanup_shm
+4. 归档到 ABORT_Cow_*
+5. 写 verdict=ABORTED 的精简 meta（不跑 L3 / RX）
+```
+
+**第 1 步为什么关键**：`stop_record` 是对 **DCA1000** 说的，雷达完全不知情，
+会按 cfg 帧数继续发射到跑完。妊娠 54000 帧那种配置，第 1 分钟中止的话
+雷达还要**空转 44 分钟**（真正停它的是下次采集开头 cfg 里那句 `sensorStop`），
+这段空转还会全部计进功耗。
+
+**第 4 步为什么关键**：不归档的话 `_Raw_*.bin` / `.pcap` / `.csv` 留在落盘
+根目录，**下次采集被残留检查挡回**。牛场里就是"按了停止，之后按开始
+永远无声失败"。归档用 `move` 而非删除，沿用"判废也只加前缀、数据保留"的规则。
+
+残留检查不会被 `ABORT_` 子目录误伤：`data_files()` 用
+`glob(base/prefix*_Raw_*.bin)`，glob 的 `*` 不跨 `/`、不递归子目录。
+
+### 守护进程判断"能否退出"：PID 比对，不是时间戳
+
+采集程序每次状态迁移把 `状态 / 时间戳 / PID` 写进 `.remote_state`，
+守护进程据此决定 POWER 双击能否退出（**只有 IDLE 放行**）。
+
+**不能用"时间戳超 N 秒即陈旧"**：`IDLE` 可以持续几小时不变，而它恰恰是
+唯一允许退出的状态 ⇒ 待命久了反而永远退不出去；
+`CAPTURING` 在 45 分钟采集里也是 2700 秒不变。
+真正要防的是"上次运行的遗留文件"，用 PID 比对更准。
+
+`set_state()` 只在**状态真的变化**时写盘 —— 主循环每秒 `set_state(IDLE)`
+一次（为让 Ctrl-C 及时响应），无条件写就是每秒一次 SD 卡写入。
+
+读不到状态时**保守拒绝退出**：误拒的代价是多按一次 `ESC`，
+误允的代价是毁掉一段采集 + 卡住下次启动。这个不对称是有意的。
+
+### 音频：设备按名字选，播放必须异步串行
+
+```
+card 0: vc4hdmi0    ← HDMI
+card 1: vc4hdmi1    ← HDMI
+card 2: Device [USB2.0 Device]   ← USB 喇叭
+```
+
+固定 `plughw:CARD=Device`（名字取自 `/proc/asound/cards` 方括号内）。
+三条理由：不给 `-D` 会落到 card 0 的 HDMI 上**没声音且不报错**；
+card 号随插拔顺序变而名字不变；`plughw` 而非 `hw` 以便自动重采样。
+
+播放的三个约束：
+
+1. **独立线程** —— `aplay` 阻塞，直接调用会推迟 `sensorStop` 之类的关键动作
+2. **串行队列** —— 两个 `aplay` 抢同一块 USB 声卡，第二个会失败；
+   队列超 3 个丢最旧，免得提示音滞后于实际状态
+3. **失败只打警告** —— 喇叭掉线、wav 缺失、`aplay` 超时都不影响采集
+
+两处必需的时序间隔：
+
+- **`preparing` 必须有声**（"采集命令下发"）：双击到 `start` 之间要跑
+  preflight、配 FPGA、起进程、发 29 条 cfg、等 `sensorStart`，实测 **10-20 秒**。
+  全程无声时人会以为没按上而反复按
+- **`done_*` 与 `ready` 之间 1.5 秒**：原本只隔三行 print（< 0.1 s），
+  换成真播放器后 `done_good` 会被吞掉或与 `ready` 叠音
+
+### ⚠ POWER 键与 systemd 的冲突
+
+`HandlePowerKey` 的 systemd 默认值是 `poweroff`，而系统自带 udev 规则
+给**所有**键设备打 `power-switch` 标签，不区分来源：
+
+```
+/usr/lib/udev/rules.d/70-power-switch.rules
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEY}=="1", TAG+="power-switch"
+```
+
+实测 event0/1/3/7/8/9 **六个节点全部**在 logind 监听范围内。
+
+手动测试时没关机是**侥幸** —— 靠桌面会话挂的一把
+`handle-power-key block` 锁（`gtk-nop`）挡着，而那把锁在命令行启动、
+桌面崩溃、或服务比桌面先起来时都不存在。
+
+已置 `HandlePowerKey=ignore`（drop-in，不改主配置）。
+守护进程运行时还会 `grab()` 独占 event7，独占期间 logind 收不到该设备按键
+—— 所以真正的暴露窗口只有**开机到服务起来之前**和**服务崩溃重启的间隙**，
+logind 配置就是堵这两个窗口。
+
+### ★ 服务不能以 root 跑（两个独立理由）
+
+1. **evdev 装在 pi 的用户目录里**
+   （`/home/pi/.local/lib/python3.11/site-packages/`，pip 用户级安装，
+   `dpkg -l python3-evdev` 查不到），root 的 `sys.path` 里没有 ⇒
+   `ModuleNotFoundError`，实测服务崩溃重启 30 次
+2. ★ **root 会静默毁掉 pcap** —— `capture_linux.py:90` 是
+   `SUDO_USER or USER or "pi"`，以 root **直接**运行时没有 `SUDO_USER`、
+   `USER=root` ⇒ `tcpdump -Z root`。而 exFAT 挂载按 `uid=1000` 固定，
+   实测 **写出 0 个包、24 字节空 pcap，退出码仍是 0**
+
+`User=pi` 权限够用（已逐条验证）：三处 sudo（`sysctl`/`tcpdump`/`kill`）
+`sudo -n` 非交互免密可用；`pi` 在 `input(102)` / `audio(29)` / `dialout(20)` 组。
+unit 必须显式 `SupplementaryGroups=input audio dialout …`，
+否则 systemd 只给主组，恰好丢掉这三个。
+
+### unit 的两个易错点
+
+**`StartLimitIntervalSec` / `StartLimitBurst` 属于 `[Unit]` 不属于 `[Service]`。**
+放错段被**静默忽略**（`systemd-analyze verify` 报 `Unknown key ... ignoring`）
+⇒ 重启限流失效，崩溃时无限重启。**装 unit 后必跑 verify。**
+
+**`TimeoutStopSec=90`。** 中止一段要发 `sensorStop`、等在途数据、停 tcpdump、
+归档，实测约 10 秒（守护进程自己等 45 秒）。给 90 秒确保 systemd 不会
+中途 SIGKILL 打断归档。配 `KillSignal=SIGINT`（走与 Ctrl-C 相同的已验证路径）
+与 `KillMode=control-group`（tcpdump / CLI_Record 不变孤儿）。
+`PYTHONUNBUFFERED=1` 必加，否则非 tty 下 stdout 块缓冲、日志延迟几十秒。
+
+### 45 分钟采集不受遥控改动影响（已核实）
+
+| 项 | 值 |
+|---|---|
+| 54000 帧 @ 50 ms | 2700 s = 45.0 min |
+| 倒计时 `wait_sec` | 2710 s（含 `BUFFER_SEC=10`），纯计数循环无上限 |
+| 帧数 vs 16 位上限 | 54000 ≤ 65535 ✓ |
+| L3 逐字节 7 GB | 约 116 s，该 `subprocess.run` **没设 timeout** |
+| `TimeoutStopSec=90` | 只在 `systemctl stop` 时生效，与正常采集无关 |
+
+遥控改动**没碰计时机制**，只把 `time.sleep(1)` 换成 `Event.wait(1)`
+（计时等价，只是可被 `ESC` 打断）。

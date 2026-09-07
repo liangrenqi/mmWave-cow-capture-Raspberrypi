@@ -282,7 +282,174 @@ pcap 载荷比 bin 多 **128 B** 属正常（末包对齐零头，CLI_Record 不
 
 ---
 
-## 五、快速诊断命令
+## 五、遥控与语音
+
+### 按遥控器没有任何反应
+
+按可能性排序：
+
+**1. 守护进程没跑。**
+
+```bash
+systemctl is-active radar-remote        # 应回 active
+journalctl -u radar-remote -n 30        # 看它到底报了什么
+```
+
+**2. 按的键与配置不符。** HID 声明的"能报哪些键"**不等于**按钮实际发什么码
+—— `event9` 的 capabilities 里有整套 163 个键，但按钮只发其中几个。
+换遥控器后必须实测，不能照 capabilities 猜：
+
+```bash
+python3 scripts/_test_input_monitor.py   # 逐个按，看实际键名与来源节点
+```
+
+**3. 两个进程抢同一个设备。** 手动跑 `capture_linux.py --remote` 时
+守护进程还开着，两边都 grab 同一节点。调试前先
+`sudo systemctl stop radar-remote`。
+
+**4. 接收器掉了。** `lsusb` 看 `27a7:2501` 还在不在。
+拔插后 event 号会变，但代码每 5 秒重扫，不需要手动干预。
+
+### 按开始键，终端里冒出 `ss` / `ee` 字符
+
+**evdev 读事件不消费它** —— 内核把同一次按键**同时**投递给 evdev 客户端
+**和**常规键盘处理器，所以不独占时遥控器仍是个普通键盘。
+
+**这不只是难看，是真实风险**：`ENTER` 会在活动控制台上"回车"，
+而实测 tty1 上正跑着 `login` + `bash` ⇒ 等于往那个 shell 里敲回车。
+封盒后无人能发现。
+
+现已**默认 grab 独占**，不该再出现。若仍出现，检查是否用了
+`--no-grab` / `--no-grab-capture`，或 grab 失败（日志里会有
+`独占 ... 失败`，通常是别的进程先占了）。
+
+### 单按一次就直接开始采集（防误触失效）
+
+双击判定被"跨节点重复"穿透了：同一次物理按下被两个 event 节点各报一次，
+间隔又超过 `MIN_GAP`（50 ms），于是被当成两次按下。
+
+```bash
+python3 scripts/_test_remote_keys.py     # 末尾会给出判定
+```
+
+判据不能只看间隔，要同时看三样：**是否同一节点、中间有没有抬起、
+间隔量级**。跨节点重复的特征是"不同节点 + 中间无抬起 + 毫秒级"。
+真是跨节点重复就调大 `MIN_GAP`，或改成只监听一个节点。
+
+### 按住开始键不放，采集反复启动
+
+`EV_KEY` 的 `value==2` 是长按自动重复，必须忽略（只认 `value==1`）。
+实测按住两秒会产生 **56 个 value==2**。
+现已忽略；若出现说明改动碰坏了这个判断。
+
+### ⚠ 按两下 POWER 把 Pi 关机了
+
+`HandlePowerKey` 的 systemd 默认值是 **`poweroff`**，而系统自带 udev 规则
+给**所有**键设备打 `power-switch` 标签，遥控器 POWER 键在 logind 监听范围内。
+
+```bash
+sudo systemd-analyze cat-config systemd/logind.conf | grep HandlePowerKey
+#   应为 ignore
+```
+
+不是 `ignore` 就补上：
+
+```bash
+sudo mkdir -p /etc/systemd/logind.conf.d
+sudo tee /etc/systemd/logind.conf.d/99-radar-remote.conf <<'EOF'
+[Login]
+HandlePowerKey=ignore
+HandlePowerKeyLongPress=ignore
+EOF
+sudo reboot        # logind 不支持 reload（CanReload=no）
+```
+
+**桌面会话那把 `handle-power-key block` 锁挡不住这个** ——
+它在命令行启动、桌面崩溃、或服务比桌面先起来时都不存在。
+
+副作用：Pi 板载电源按钮短按也不再关机，改用 `sudo poweroff`。
+
+### 服务反复重启（`Scheduled restart job, restart counter is at N`）
+
+```bash
+journalctl -u radar-remote -n 50 | grep -iE "error|Traceback|No module"
+```
+
+已知两种：
+
+**`ModuleNotFoundError: No module named 'evdev'`** ——
+unit 里写了 `User=root`，而 evdev 是 pip 装在 `/home/pi/.local/...` 的
+**用户级**安装，root 看不见（`dpkg -l python3-evdev` 查不到）。
+必须用 `User=pi`。
+
+**限流没生效、无限重启** —— `StartLimitIntervalSec` / `StartLimitBurst`
+属于 `[Unit]` 段，写在 `[Service]` 里会被**静默忽略**：
+
+```bash
+systemd-analyze verify /etc/systemd/system/radar-remote.service
+#   报 "Unknown key ... ignoring" 就是放错段了
+```
+
+### ★ 服务以 root 跑，pcap 变成 24 字节空文件
+
+`capture_linux.py:90` 是 `SUDO_USER or USER or "pi"`，以 root **直接**运行时
+没有 `SUDO_USER`、`USER=root` ⇒ `tcpdump -Z root`。
+而 exFAT 挂载按 `uid=1000` 固定，实测 **`-Z root` 写出 0 个包、
+退出码仍是 0** —— 采完 45 分钟才发现全废。
+
+unit 必须 `User=pi`，并显式给
+`SupplementaryGroups=input audio dialout …`（否则 systemd 只给主组，
+恰好丢掉这三个）。
+
+### 没有声音
+
+```bash
+python3 scripts/_test_audio.py           # 按实际顺序播一遍
+cat /proc/asound/cards                   # 方括号里的名字才是 CARD=
+```
+
+三种成因：
+
+**落到 HDMI 上了。** 不给 `-D` 时 aplay 用默认设备 = card 0 的 HDMI，
+**没声音且不报错**。代码固定用 `plughw:CARD=Device`，**按名字不按编号**
+（编号随插拔顺序变，名字不变）。
+
+**wav 缺失。** 启动时 `_probe()` 会一次性报清缺哪些文件。
+`python3 scripts/_test_audio.py --gen` 生成占位音。
+
+**用了 `--no-audio`。** 那是故意静音的调试选项。
+
+### "通过"的语音听不到 / 与"可以采集"叠在一起
+
+`done_*` 与 `ready` 之间有 **1.5 秒**间隔（`_remote_loop` 里 `if n > 0`）。
+去掉那个间隔就会出现这个现象 —— 两个 `aplay` 抢同一块 USB 声卡，
+第二个直接失败。
+
+### 采集中按 POWER 退不出程序
+
+**这是设计如此，不是故障。** 硬杀采集程序会让雷达**收不到 `sensorStop`
+而继续发射到帧数跑完**，且游离文件会卡死下次采集。
+故只有采集程序空闲（IDLE）时才放行，否则播"采集进行中，请先按返回键中止"。
+
+要中止当前这段请按 `ESC`。
+
+### 空闲时按 POWER 也退不出（一直播"忙"）
+
+守护进程读不到采集程序的状态文件，按**保守拒绝**处理。
+
+```bash
+cat ~/mmwave-cow-capture/scripts/.remote_state    # 状态 / 时间戳 / PID
+```
+
+判据是 **PID 比对**而非时间戳 —— 因为 IDLE 可以持续几小时不变，
+而它恰恰是唯一允许退出的状态，按时间判陈旧会导致待命久了永远退不出去。
+文件里的 PID 与当前子进程不符即视为遗留。
+
+实在退不出：`sudo systemctl restart radar-remote`。
+
+---
+
+## 六、快速诊断命令
 
 ```bash
 # 雷达在应答吗
@@ -316,11 +483,36 @@ python3 scripts/verify_pcap_bin.py <session_dir> --frame-bytes 737280
 
 # 单独查 RX 通道
 python3 scripts/check_quality.py <session_dir> --cfg config/cow_behavior.cfg
+
+# ---- 遥控与语音 ----
+
+# 守护进程活着吗
+systemctl is-active radar-remote && journalctl -u radar-remote -n 20
+
+# 遥控器还在吗（拔插后 event 号会变，代码自动重扫）
+lsusb -d 27a7:2501
+python3 scripts/remote_daemon.py --check      # 设备 + logind + 音频一次查完
+
+# 按钮实际发什么键码（换遥控器后必测）
+python3 scripts/_test_input_monitor.py
+
+# POWER 会不会关机
+sudo systemd-analyze cat-config systemd/logind.conf | grep HandlePowerKey
+
+# 喇叭与音频
+cat /proc/asound/cards                        # 方括号里的名字才是 CARD=
+python3 scripts/_test_audio.py
+
+# 采集程序当前状态（守护进程据此决定能否退出）
+cat ~/mmwave-cow-capture/scripts/.remote_state
+
+# unit 语法（放错段的键会被静默忽略）
+systemd-analyze verify /etc/systemd/system/radar-remote.service
 ```
 
 ---
 
-## 六、几条容易误判的经验
+## 七、几条容易误判的经验
 
 | 现象 | 不是故障 |
 |---|---|
@@ -332,3 +524,9 @@ python3 scripts/check_quality.py <session_dir> --cfg config/cow_behavior.cfg
 | 采集后 `/proc/net/udp` 读不到 | socket 已关闭，必须采集期间轮询 |
 | DCA1000 灯采完后不闪 | 雷达已停止出流，封口缓冲期无数据 |
 | 满量程只用 5% | 可能是场景，软件判不了 |
+| 双击到"采集开始"隔 10–20 秒 | 要跑自检、配卡、起进程、发 29 条 cfg、等 sensorStart |
+| 采集中按 POWER 退不出 | 设计如此，防止雷达不停 + 游离文件卡死下次采集 |
+| 采集中按 ENTER 无反应 | 开始键已锁定，防误触 |
+| 按住按键不放没反复触发 | `value==2`（长按重复）被有意忽略 |
+| 板载电源键短按不关机 | logind 已置 ignore，用 `sudo poweroff` |
+| `event9` 声明有 163 个键 | 那是 HID 能力上限，不等于按钮实际发的码 |

@@ -16,6 +16,7 @@ IWR6843 + DCA1000 采集脚本（Linux / 树莓派 5）
     python3 capture_linux.py                  # 单次采集
     python3 capture_linux.py --no-pcap        # 不抓 pcap
     python3 capture_linux.py --loop 5         # 连续采 5 段
+    python3 capture_linux.py --remote         # 遥控模式（2.4G 遥控器/键盘起停）
 """
 
 import argparse
@@ -37,6 +38,13 @@ try:
     import serial
 except ImportError:
     sys.exit("[ERROR] 需要 pyserial: pip3 install pyserial")
+
+# 遥控模块是可选的：不加 --remote 时完全不需要 evdev，
+# 原有的命令行用法与部署不受影响。
+try:
+    import remote_control
+except ImportError:
+    remote_control = None
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -83,6 +91,8 @@ PCAP_USER = os.environ.get("SUDO_USER") or os.environ.get("USER") or "pi"
 
 BUFFER_SEC = 10                  # 雷达停止后 DCA1000 封口缓冲
 SENSOR_START_TIMEOUT = 12        # 等 sensorStart 裁决的秒数（失败时会死锁）
+ABORT_SETTLE_SEC = 3             # 中止时给 DCA1000 吐完在途数据的时间
+                                 # （比 BUFFER_SEC 短：中止的数据本就不指望用）
 
 # mmwavelink 的字段宽度上限。两者都是 rlUInt16_t/文档明写的范围，
 # 超了不报错、静默回绕（见 check_consistency 的注释）。
@@ -823,6 +833,205 @@ def send_cfg(profile_path):
     return (not errors) and sensor_started, errors, sensor_started
 
 
+def send_sensor_stop(timeout=3.0):
+    """单独发一条 sensorStop —— 提前中止时唯一能真正停下雷达的手段
+
+    为什么必须单独发：send_cfg() 发完最后一条就 close() 了串口，收尾段
+    一条串口命令都没有。原先的 Ctrl-C 路径只发 stop_record，而那是对
+    **DCA1000** 说的 —— 雷达完全不知情，会按 cfg 里的帧数继续发射到
+    跑完为止。妊娠 54000 帧那种配置，第 1 分钟中止的话雷达还要空转
+    44 分钟，真正让它停下来的是**下一次采集开头 cfg 里的那句 sensorStop**。
+    check_field_limits 的注释里早就写明了这个行为（"收尾只发 stop_record
+    不发 sensorStop，雷达不会停"），只是此前没有提前中止的需求。
+
+    这段空转还会全部计进阶段 7 要测的功耗里。
+
+    失败必须明确报出来，不能静默略过：串口打不开（ModemManager 抢占、
+    USB 重新枚举中）意味着雷达停不下来，这是需要人工拔 5V 的情形。
+    """
+    print("  -> 发送 sensorStop 到雷达 ...", end=" ", flush=True)
+    try:
+        ser = serial.Serial(port=RADAR_PORT, baudrate=RADAR_BAUDRATE,
+                            timeout=1)
+    except serial.SerialException as e:
+        print(f"[FAIL] {e}")
+        print("     ⚠ 雷达没有收到停止命令，会继续发射到帧数跑完为止。")
+        print("       若要立刻停：拔掉雷达 5V 电源。")
+        return False, str(e)
+
+    try:
+        ser.reset_input_buffer()
+        ser.write(b"sensorStop\n")
+        lines, t0 = [], time.time()
+        while time.time() - t0 < timeout:
+            if ser.in_waiting:
+                chunk = ser.read(ser.in_waiting).decode(errors="replace")
+                for l in (x.strip() for x in chunk.splitlines()):
+                    if l:
+                        lines.append(l)
+                low = " ".join(lines).lower()
+                # "Done" 是正常应答；已经停了的话回 "Ignored: Sensor is
+                # already stopped"，那同样算达成目的
+                if "done" in low or "already stopped" in low:
+                    break
+            else:
+                time.sleep(0.05)
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+    reply = " | ".join(lines) if lines else "(无回显)"
+    low = reply.lower()
+    ok = ("done" in low) or ("already stopped" in low)
+    print("[OK]" if ok else "[WARN]")
+    if lines:
+        for l in lines:
+            print(f"       <- {l}")
+    if not ok:
+        print(f"     ⚠ {timeout:.0f} 秒内没等到 Done —— 雷达可能仍在发射。")
+    return ok, reply
+
+
+def abort_capture(jc, fc, pcap_proc, rec_proc, dropmon, t0, reason,
+                  notifier=None, settle_sec=ABORT_SETTLE_SEC,
+                  use_pcap=True, serial_errs=None):
+    """中止收尾 —— 停止键与 Ctrl-C 走这同一条路
+
+    与正常收尾（_run 的 [6][7][8]）的三处区别：
+      1. **先发 sensorStop** —— 正常路径不需要，雷达跑完帧数会自己停
+      2. 只等 settle_sec 秒而不是 BUFFER_SEC，中止的数据本就不指望用
+      3. 归档到 ABORT_ 前缀目录，**不跑判据**（不跑 L3、不跑 RX 检测）
+
+    **归档这一步是本函数存在的首要理由。** 原先的 Ctrl-C 路径不归档，
+    _Raw_*.bin / .pcap / .csv 全留在 fileBasePath 根目录变成游离文件，
+    于是**下一次采集会被 capture() 里的残留检查直接挡回并 return False**。
+    牛场里这意味着：饲养员按了停止键，之后按开始键永远无声失败 ——
+    而封盒后没有屏幕能看到那条报错，现象就是"遥控器坏了"。
+    2026-08-06 帧数回绕那次实测踩到过这个（当时的记录：
+    "手动 Ctrl-C 收场，留下三个游离文件没归档"）。
+
+    数据**移走归档而不是删除**，沿用"判废也只加前缀、数据保留不删"
+    的既有规则。中止前那段数据有时仍然可用，删了不可逆。
+    """
+    base, prefix = jc["base_path"], jc["prefix"]
+    if notifier:
+        notifier.emit("aborting", reason)
+
+    print("\n[中止] " + reason)
+
+    # 先停 dropmon：stop_record 会关掉 socket，之后 /proc/net/udp 读不到
+    if dropmon is not None:
+        dropmon.stop()
+
+    # ① 让雷达真的停下来。放在最前面 —— 每晚一秒就多空转一秒。
+    stop_ok, stop_reply = send_sensor_stop()
+
+    # ② 给 DCA1000 一点时间把在途数据推完再关记录，避免 pcap 断在半包
+    print(f"  -> 等待 {settle_sec:.0f} 秒让在途数据落地 ...")
+    time.sleep(settle_sec)
+
+    # ③ 之后与正常收尾同序：stop_record → tcpdump → 清进程
+    cli("stop_record", "stop_record")
+    tcpdump_stats = stop_tcpdump(pcap_proc) if use_pcap else ""
+    kill_record_proc()
+    if rec_proc is not None and rec_proc.poll() is None:
+        rec_proc.terminate()
+    cleanup_shm()
+
+    # ④ 归档。t0 为 None 表示还没进入采集（准备阶段就中止了），
+    #    用当前时刻命名，目录名里不写"到几点"。
+    t_ref = t0 or datetime.now()
+    name = (f"ABORT_Cow_{COW_ID}_{CAPTURE_MODE}_{t_ref:%Y%m%d_%H%M%S}")
+    session = os.path.join(base, name)
+
+    print("\n[中止归档]")
+    moved = []
+    for p in data_files(base, prefix):
+        if os.path.isfile(p):
+            os.makedirs(session, exist_ok=True)
+            shutil.move(p, os.path.join(session, os.path.basename(p)))
+            moved.append(os.path.basename(p))
+
+    if not moved:
+        # 准备阶段就中止、雷达还没出流时是正常的
+        print("  -> 没有产生任何数据文件（中止得早），无需归档")
+        if notifier:
+            notifier.emit("done_abort", "无数据文件")
+        return None
+
+    for fn in sorted(moved):
+        size = os.path.getsize(os.path.join(session, fn))
+        print(f"     {fn}  {size:,} B")
+
+    bins = sorted(glob.glob(os.path.join(session, "*_Raw_*.bin")))
+    total = sum(os.path.getsize(b) for b in bins)
+    got_frames = total // fc["frame_bytes"] if fc["frame_bytes"] else 0
+    planned = fc["frames"]
+    elapsed = (datetime.now() - t0).total_seconds() if t0 else 0.0
+
+    print(f"  -> 实际完整帧 {got_frames:,} / 预定 {planned:,}"
+          f"（{got_frames / planned * 100:.1f}%），bin {total:,} B")
+
+    # ⑤ 精简 meta。verdict 仍放最前，机器 grep "^verdict=" 的约定不变；
+    #    ABORTED 是新增的第四种取值（原有 GOOD / BAD / UNKNOWN）。
+    with open(os.path.join(session, "capture_meta.txt"), "w",
+              encoding="utf-8") as f:
+        f.write("# ===== 判定 =====\n")
+        f.write("verdict=ABORTED\n")
+        f.write(f"verdict_reason=人工中止: {reason}\n")
+        f.write("checks_total=0\nchecks_passed=0\nchecks_failed=0\n")
+        f.write("checks_unknown=0\n")
+        f.write("# 中止的数据不跑判据（L3 逐字节与 RX 通道检测均未执行）。\n")
+        f.write("# 要事后补判： verify_pcap_bin.py <本目录> --frame-bytes "
+                f"{fc['frame_bytes']}\n")
+
+        f.write("\n# ----- 中止信息 -----\n")
+        f.write("stop_reason=manual_abort\n")
+        f.write(f"abort_detail={reason}\n")
+        f.write(f"sensor_stop_sent={'yes' if stop_ok else 'FAILED'}\n")
+        f.write(f"sensor_stop_reply={stop_reply}\n")
+        f.write(f"frames_planned={planned}\n")
+        f.write(f"frames_captured={got_frames}\n")
+        f.write(f"elapsed_sec={elapsed:.1f}\n")
+        f.write(f"settle_sec={settle_sec}\n")
+
+        f.write("\n# ----- 采集参数 -----\n")
+        f.write(f"cow_id={COW_ID}\nmode={CAPTURE_MODE}\nnote={NOTE}\n")
+        f.write(f"cfg_file={os.path.basename(PROFILE_CFG)}\n")
+        f.write(f"json_file={os.path.basename(JSON_CFG)}\n")
+        f.write(f"frames={fc['frames']}\nperiod_ms={fc['period_ms']}\n")
+        f.write(f"loops={fc['loops']}\n")
+        f.write(f"samples={fc['samples']}\ntx_count={fc['tx_count']}\n")
+        f.write(f"rx_count={fc['rx_count']}\n")
+        f.write(f"channel_cfg={fc['rx_mask']} {fc['tx_mask']} 0\n")
+        f.write(f"frame_bytes={fc['frame_bytes']}\n")
+        f.write(f"bin_total_bytes={total}\nbin_files={len(bins)}\n")
+        if t0:
+            f.write(f"start={t0:%Y-%m-%d %H:%M:%S}\n")
+        f.write(f"aborted_at={datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        f.write(f"pcap={'yes' if use_pcap else 'no'}\n")
+        f.write(f"host={os.uname().nodename}\n")
+        if tcpdump_stats:
+            f.write(f"tcpdump_stats={tcpdump_stats}\n")
+        if serial_errs:
+            f.write(f"serial_errors={len(serial_errs)}\n")
+            for e in serial_errs:
+                f.write(f"  {e}\n")
+
+    print(f"\n  数据: {session}")
+    if not stop_ok:
+        print("  ⚠ sensorStop 未确认成功 —— 下次采集前确认雷达已停"
+              "（或拔 5V 重上电）")
+    if notifier:
+        notifier.emit("done_abort",
+                      f"{got_frames}/{planned} 帧")
+    print("=" * 62)
+    return session
+
+
+
 def tcpdump_buf_kb(rate_bps, seconds=8.0, floor_kb=8192):
     """按码率算 -B（单位 KB），而不是拍一个固定数
 
@@ -1073,7 +1282,7 @@ def check_pcap(session_dir, expect_bytes=None):
             "card_sent": card_sent, "l1_gap": l1_gap, "l2_gap": l2_gap}
 
 
-def capture(idx, jc, fc, use_pcap, run_l3=True):
+def capture(idx, jc, fc, use_pcap, run_l3=True, remote=None, notifier=None):
     base = jc["base_path"]
     prefix = jc["prefix"]
     dur = fc["frames"] * fc["period_ms"] // 1000
@@ -1125,6 +1334,7 @@ def capture(idx, jc, fc, use_pcap, run_l3=True):
 
     pcap_proc = None
     rec_proc = None
+    dropmon = None
     try:
         if use_pcap:
             print("\n[2] 启动抓包")
@@ -1151,23 +1361,25 @@ def capture(idx, jc, fc, use_pcap, run_l3=True):
         dropmon.start()
         try:
             return _run(idx, jc, fc, use_pcap, pcap_proc, rec_proc, dropmon, t_setup,
-                        run_l3)
+                        run_l3, remote, notifier)
         finally:
             dropmon.stop()
-    except Exception:
-        # tcpdump 一旦起来就必须回收，否则异常退出会留下后台进程继续写 pcap
-        print("\n  [异常] 收尾中")
-        cli("stop_record", "stop_record")
-        stop_tcpdump(pcap_proc)
-        kill_record_proc()
-        if rec_proc and rec_proc.poll() is None:
-            rec_proc.terminate()
-        cleanup_shm()
+    except (Exception, KeyboardInterrupt) as e:
+        # tcpdump 一旦起来就必须回收，否则异常退出会留下后台进程继续写 pcap。
+        # 走 abort_capture 而不是各自清理：它会发 sensorStop（否则雷达继续
+        # 空转）并把游离文件归档（否则下次采集被残留检查挡死）。
+        # 连 KeyboardInterrupt 一起捕获：准备阶段（起 tcpdump / 发 cfg）按
+        # Ctrl-C 同样会留下 pcap 文件和运行中的进程，光靠 _run 里那个
+        # 倒计时的 except 覆盖不到这一段。
+        why = "Ctrl-C" if isinstance(e, KeyboardInterrupt) \
+            else f"异常中止: {type(e).__name__}: {e}"
+        abort_capture(jc, fc, pcap_proc, rec_proc, dropmon, None, why,
+                      notifier=notifier, use_pcap=use_pcap)
         raise
 
 
 def _run(idx, jc, fc, use_pcap, pcap_proc, rec_proc, dropmon, t_setup,
-         run_l3=True):
+         run_l3=True, remote=None, notifier=None):
     base, prefix = t_setup["base"], t_setup["prefix"]
     dur, wait_sec = t_setup["dur"], t_setup["wait_sec"]
 
@@ -1181,11 +1393,11 @@ def _run(idx, jc, fc, use_pcap, pcap_proc, rec_proc, dropmon, t_setup,
     # 前面命令的报错照样记进 meta，让人事后判断，但不掐断采集。
     if not ok and not started:
         print("  [ERROR] cfg 发送失败且 sensorStart 未成功，收尾")
-        dropmon.stop()
-        cli("stop_record", "stop_record")
-        stop_tcpdump(pcap_proc)
-        kill_record_proc()
-        cleanup_shm()
+        # 走 abort_capture：此时 tcpdump 已经建出 pcap 文件，不归档的话
+        # 它会留在 fileBasePath 根目录，把下一次采集的残留检查挡死。
+        abort_capture(jc, fc, pcap_proc, rec_proc, dropmon, None,
+                      "cfg 发送失败且 sensorStart 未成功",
+                      notifier=notifier, use_pcap=use_pcap, serial_errs=errs)
         return False
     if not ok and started:
         print(f"  [WARN] 有 {len(errs)} 条命令报错，但 sensorStart 已成功 ——")
@@ -1193,24 +1405,46 @@ def _run(idx, jc, fc, use_pcap, pcap_proc, rec_proc, dropmon, t_setup,
 
     t0 = datetime.now()
     print(f"\n  ** 采集开始 {t0:%Y-%m-%d %H:%M:%S}")
+    # 到这里雷达才真正在发射。提示音放这里而不是按键那一刻 —— 中间隔着
+    # preflight/配卡/起进程/发 cfg，实测约 10-20 秒。
+    if remote is not None:
+        remote.set_state(remote_control.CAPTURING)
+    if notifier:
+        notifier.emit("start", f"{fc['frames']} 帧 / {dur} 秒")
 
     print(f"\n[5] 等待 {wait_sec} 秒")
+    aborted = None
     try:
         for r in range(wait_sec, 0, -1):
             sys.stdout.write(f"\r  剩余 {r:4d} 秒 ")
             sys.stdout.flush()
-            time.sleep(1)
+            if remote is not None:
+                # 可被停止键打断的等待。stop_evt 在**准备阶段**按下也会 set，
+                # 所以第一次循环就可能命中 —— 那正是"准备阶段按了停止键，
+                # 等采集真正开始后立刻中止"的实现方式。
+                if remote.sleep(1):
+                    aborted = "饲养员按下停止键"
+                    break
+            else:
+                time.sleep(1)
     except KeyboardInterrupt:
-        print("\n  [中断] 收尾中")
-        dropmon.stop()
-        cli("stop_record", "stop_record")
-        stop_tcpdump(pcap_proc)
-        kill_record_proc()
-        cleanup_shm()
+        aborted = "Ctrl-C"
+
+    if aborted:
+        print()
+        if remote is not None:
+            remote.set_state(remote_control.ABORTING)
+        abort_capture(jc, fc, pcap_proc, rec_proc, dropmon, t0, aborted,
+                      notifier=notifier, use_pcap=use_pcap, serial_errs=errs)
         return False
     print("\r  等待结束        ")
 
     print("\n[6] 停止")
+    # 从这里开始不可打断：正在归档与逐字节校验，中断会毁掉一段已采好的数据
+    if remote is not None:
+        remote.set_state(remote_control.FINALIZING)
+    if notifier:
+        notifier.emit("finalizing")
     # 先停 dropmon：stop_record 会关闭 socket，那之后 /proc/net/udp 就读不到了
     dropmon.stop()
 
@@ -1346,10 +1580,16 @@ def _run(idx, jc, fc, use_pcap, pcap_proc, rec_proc, dropmon, t_setup,
         session = bad
         print(f"  [BAD] {reason}")
         print("        已加 BAD_ 前缀（数据保留，未删除）")
+        if notifier:
+            notifier.emit("done_bad", "判据失败: " + ", ".join(fails))
     elif verdict == "UNKNOWN":
         print(f"  [UNKNOWN] {reason}")
+        if notifier:
+            notifier.emit("done_bad", "所有判据均无法判定")
     else:
         print(f"  [GOOD] {reason}")
+        if notifier:
+            notifier.emit("done_good", f"{fc['frames']} 帧 / {total:,} B")
     clean = False if verdict == "BAD" else (None if verdict == "UNKNOWN" else True)
 
     # UTF-8：第一阶段用 ASCII 是为了避开 Studio 输出窗口的 GBK 解码，
@@ -1413,6 +1653,81 @@ def _run(idx, jc, fc, use_pcap, pcap_proc, rec_proc, dropmon, t_setup,
     return clean is not False
 
 
+def _remote_loop(args, jc, fc, run_l3):
+    """遥控模式主循环：等按键 → 采一段 → 回到等待
+
+    与 --loop N 的区别：不预设段数。采完（或中止后）回到 IDLE 继续等
+    下一次按键，饲养员想采几段就采几段。
+
+    Ctrl-C 的两重语义：
+      等待按键时按 → 退出程序（本函数的 except 捕获）
+      采集进行中按 → 中止当前这一段并归档，程序继续等下一次按键
+                     （由 _run 的倒计时与 capture 的 except 处理）
+    """
+    if remote_control is None:
+        sys.exit("[ERROR] --remote 需要 remote_control.py（与本脚本同目录）"
+                 "和 python3-evdev\n"
+                 "        安装： sudo apt install python3-evdev")
+
+    # 语音提示：优先用 USB 喇叭（AudioNotifier），它内部会 fallback 到
+    # LogNotifier，所以终端输出不会因为接了喇叭而消失。
+    # --no-audio 只打日志不出声（夜里调试、或喇叭没插时用）。
+    if args.no_audio:
+        notifier = remote_control.LogNotifier()
+    else:
+        notifier = remote_control.AudioNotifier()
+    try:
+        rc = remote_control.RemoteController(notifier=notifier, grab=args.grab,
+                                            state_file=args.state_file)
+    except (RuntimeError, ValueError) as e:
+        sys.exit(f"[ERROR] 遥控初始化失败: {e}")
+
+    print("\n" + "=" * 62)
+    print("  遥控模式")
+    print(f"  开始 : 连按两次 [{remote_control.START_KEY.upper()}]"
+          f"（{remote_control.DOUBLE_WINDOW:.0f} 秒内）")
+    print(f"  停止 : [{remote_control.STOP_KEY.upper()}]（紧急中止，"
+          "数据归档到 ABORT_ 目录、不跑判据）")
+    print("  采集开始后开始键锁定，直到归档与校验全部结束才解锁")
+    print("  Ctrl-C 退出程序")
+    print("=" * 62)
+    rc.start()
+
+    n = 0
+    try:
+        while True:
+            rc.set_state(remote_control.IDLE)
+            # 让上一段的结束音效（done_good/done_bad/done_abort/error）
+            # 有时间播完再发 ready —— 否则两个音频背靠背，done_* 会被吞掉
+            # 或叠在一起。这个停顿也充当明确的段间分界，语义上合理。
+            if n > 0:
+                time.sleep(1.5)
+            # 分段等待而不是无限阻塞 —— 让 Ctrl-C 能及时退出
+            if not rc.wait_for_start(timeout=1.0):
+                continue
+
+            n += 1
+            rc.set_state(remote_control.PREPARING)
+            try:
+                capture(n, jc, fc, not args.no_pcap, run_l3,
+                        remote=rc, notifier=notifier)
+            except KeyboardInterrupt:
+                # 采集中的 Ctrl-C：capture 已经走完 abort_capture 归档，
+                # 这里只是不让它冒泡到外层把程序也结束掉
+                print("\n  本段已中止，回到待命状态")
+            except Exception as e:
+                notifier.emit("error", f"{type(e).__name__}: {e}")
+                print(f"\n  [ERROR] 本段采集异常: {e}")
+            print()
+    except KeyboardInterrupt:
+        print("\n  退出遥控模式")
+    finally:
+        rc.close()
+        # 关掉播放线程，否则解释器要等它超时才退出
+        if hasattr(notifier, "close"):
+            notifier.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-pcap", action="store_true", help="不并行抓 pcap")
@@ -1425,6 +1740,19 @@ def main():
                          "RX 通道检测不受影响，它只需约 1 秒")
     ap.add_argument("--verify", action="store_true",
                     help="强制开启 L3（覆盖 CAPTURE_L3 环境变量）")
+    ap.add_argument("--remote", action="store_true",
+                    help="遥控模式：用 2.4G 遥控器/键盘控制起停，"
+                         "不预设段数，采完回到待命")
+    ap.add_argument("--grab", action="store_true",
+                    help="遥控模式下独占输入设备（按键不再进入系统，"
+                         "终端里不回显）。封盒后建议开，调试时默认关")
+    ap.add_argument("--no-audio", action="store_true",
+                    help="遥控模式下不播语音提示，只打日志"
+                         "（喇叭没插、或夜里调试时用）")
+    ap.add_argument("--state-file", default=None,
+                    help="把遥控状态机的当前状态写到该文件，供 "
+                         "remote_daemon.py 判断能否退出。由守护进程传入，"
+                         "手动运行时不必给")
     args = ap.parse_args()
 
     # 用 --mode 覆盖默认值。原先靠改 JSON_CFG/PROFILE_CFG 两个常量切换波形，
@@ -1472,7 +1800,17 @@ def main():
     print(f"  L3 比对   : {'开' if run_l3 else '关'}（{l3_src}）"
           + (f"，预计约 {est:.0f} 秒" if run_l3 and not args.no_pcap else ""))
     print(f"  牛号/模式 : {COW_ID} / {CAPTURE_MODE}")
+    print(f"  遥控      : {'开' if args.remote else '关'}"
+          + ("（独占输入设备）" if args.remote and args.grab else "")
+          + ("（无语音）" if args.remote and args.no_audio else ""))
     print("=" * 62)
+
+    # 遥控模式不预设段数，由按键驱动，故与 --loop / --yes 都不相干
+    if args.remote:
+        if args.loop != 1:
+            print("  [提示] --remote 下 --loop 无效 —— 不预设段数，"
+                  "采完回到待命等下一次按键")
+        return _remote_loop(args, jc, fc, run_l3)
 
     if not args.yes:
         if input("\n开始？(Enter 继续 / q 退出) ").strip().lower() == "q":
