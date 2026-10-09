@@ -29,6 +29,20 @@ pip 用户级安装会落到 `~/.local/lib/python3.11/site-packages/`，
 `ModuleNotFoundError` 且服务无限重启（本项目实测踩过，见 CHANGELOG）。
 本机当前就是 pip 装的，故 unit 必须 `User=pi`。
 
+心率带 Polar H10 额外需要 bleak（不采心率带可跳过，雷达照常采）：
+
+```bash
+sudo apt install python3-dbus-fast bluez
+pip install --user bleak==3.0.2     # 本机装在 ~/.local；若系统报 externally-managed 再加 --break-system-packages
+python3 -c "import importlib.metadata as m; print(m.version('bleak'))"   # 3.0.2
+```
+
+不需要 Polar SDK：H10 的 HR 与 PMD（ECG/ACC）都是标准 GATT，
+`h10_logger.py` 只存原始字节，解析离线做。
+bleak 同样是用户级安装，**同样要求 unit 是 `User=pi`**。
+本项目实测（2026-10-09 V3）服务环境下 `bluetoothctl remove` rc=0、建连正常，
+没有额外加 `bluetooth` 组。
+
 ---
 
 ## 1. 编译 TI CLI
@@ -200,6 +214,7 @@ python3 scripts/probe_radar.py
 | 5.5 | 行为 cfg 能否 sensorStart | `send_cfg_only.py` 31 条全 Done |
 | 6 | 行为满测（3000 帧） | 六项判据 PASS |
 | 6.5 | 遥控 + 语音 + 开机自启 | 见第 7 步，四项实测 |
+| 6.6 | 心率带 H10 随段采集 | 见 7.6；2026-10-09 V2/V2-R/V3 全过 |
 | 7 | 功耗与温度 | 待做 |
 
 阶段 4 用短配置先跑通链路：把 cfg 的 `frameCfg` 第 4 字段和 json 的
@@ -272,7 +287,7 @@ python3 scripts/_test_remote_keys.py        # 验证双击、去抖、长按忽�
 
 ```bash
 cat /proc/asound/cards        # 方括号里的名字才是 CARD= 要填的
-python3 scripts/_test_audio.py --gen        # 生成 11 个占位音（纯合成）
+python3 scripts/_test_audio.py --gen        # 生成缺失的占位音（共 15 个，纯合成；已有的不覆盖）
 python3 scripts/_test_audio.py              # 按实际顺序播一遍，验证喇叭
 ```
 
@@ -316,9 +331,9 @@ unit 必须显式写 `SupplementaryGroups=input audio dialout …`，
 
 重启后**不敲任何命令**：
 
-- [ ] 听到"设备就绪" ← 自启成功
+- [ ] 听到"守护进程已启动"（`daemon_ready.wav`）← 自启成功
 - [ ] `POWER` × 2 → "采集程序启动" → `ENTER` × 2 → "采集命令下发" →
-      （10-20 秒）→ "采集开始" → 采完 → "通过"
+      "心率带已连接" →（15–30 秒）→ "采集开始" → 采完 → "通过"
 - [ ] 采集中按 `ENTER` 被锁定（防误触）、按 `POWER` 被拒绝（播"忙"）
 - [ ] 采集中按 `ESC` → 中止并归档到 `ABORT_` 目录，
       **之后立刻还能重新开始**（验证游离文件没卡住下次采集）
@@ -330,6 +345,39 @@ python3 scripts/remote_daemon.py --check   # 设备 + logind + 音频一次查�
 
 最后那项判据最关键：原 Ctrl-C 路径不归档，游离文件会留在落盘根目录
 导致下次采集被残留检查挡死 —— 封盒后没屏幕，现象就是"遥控器坏了"。
+
+### 7.6 心率带 H10
+
+前提：第 0 步的 bleak 已装，H10 已佩戴且电极湿润（干放不广播，扫不到）。
+
+**WiFi 必须在 5 GHz。** 2026-09-28 实测：2.4 GHz WiFi 开着时 BLE 建连 15/15 失败
+（HCI 0x3e），关 WiFi 或改 5 GHz 后正常。Pi 的 WiFi 与蓝牙共用一颗芯片和天线。
+
+```bash
+nmcli -t -f ACTIVE,SSID,FREQ dev wifi | grep ^yes      # FREQ 应为 5xxx
+```
+
+**锁 5G 的注意点**：开机时 5G 连不上，NetworkManager 会按优先级自动回落到 2.4G 的配置
+（2026-10-08 实测踩过：路由器 5G 没广播，Pi 静默回到 2.4G）。
+`802-11-wireless.band a` 只约束单条连接配置，不会阻止回落到另一条配置，
+需要的话把 2.4G 的配置设为不自动连接。
+
+H10 的地址默认 `24:AC:AC:11:CC:D4`。换一条带子时：
+
+```bash
+bluetoothctl scan on            # 戴上后看新出现的 24:AC:AC:... 地址（广播可以不带名字）
+export H10_ADDRESS=<新地址>     # 或改 scripts/h10_session.py 的 H10_ADDRESS 默认值
+```
+
+**判据**：
+
+```bash
+python3 scripts/_test_h10_session.py      # 离线 7 个场景，假 logger，不需要 H10
+```
+
+Pi 上跑这个走真信号 + GNU `timeout`，全部应通过（Windows 上信号是垫片模拟的，不算数）。
+之后采一段，`capture_meta.txt` 里应有 `h10=OK`、`h10_pmd_lead_sec` 与 `h10_pmd_tail_sec` 都为正，
+段目录里有 `h10_*.log` 和 `.stdout.txt`，`_h10_staging/` 为空。
 
 ---
 
@@ -350,5 +398,8 @@ python3 scripts/remote_daemon.py --check   # 设备 + logind + 音频一次查�
 | 按两下 POWER 关机了 | 7.1 没做 |
 | 服务无限重启 | `User=root` 找不到 evdev，或限流键放错段 |
 | 没声音 | 落到 HDMI 上了，须 `plughw:CARD=<名字>` |
+| H10 扫不到 | 没佩戴或电极干；按名字找（广播可以不带名字），应按 MAC |
+| H10 建连反复失败（0x3e） | WiFi 在 2.4 GHz |
+| `h10_status=START_FAILED` | bleak 没装，或服务不是 `User=pi` 看不见用户级包 |
 
 更多见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。

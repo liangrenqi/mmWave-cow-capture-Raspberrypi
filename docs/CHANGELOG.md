@@ -6,6 +6,80 @@
 
 ---
 
+## 2026-10-09
+
+### 并入 Polar H10 心率带（已实测通过，commit bd6bd34）
+
+人体实验与牛场都要逐拍心跳真值（牛场也给牛戴 H10）。手机 App 导出的时间轴
+各自从 0 起算、只有秒级绝对时刻，无法与雷达做亚秒同步，所以改由 Pi 直接收 H10：
+通知到达时刻与 pcap 包时刻用同一个 `CLOCK_REALTIME`。
+
+**用户 09-30 定的原则：心率带必须独立于雷达采集进程。** 落成：
+
+- 新增 `scripts/h10_session.py`：每段一个 H10 进程。自检通过后用
+  `timeout -k 20 -s INT` 拉起 `h10_logger.py`，`start_new_session` 自成进程组；
+  段末 SIGINT 不等，`finish` 时把日志移进该段目录（正常 / `BAD_` / `ABORT_` 都移），
+  没有段目录归 `H10_ORPHAN/`
+- **H10 的任何故障都不进 checks、不影响 verdict**，只在 meta 写 `h10=` 一行与 `h10_*` 一节
+- 雷达开采前**等首个 PMD，最多 10 秒**（`FIRST_PMD_WAIT`）。依据：V2 首轮实测
+  H10 拉起到首个 PMD 6.3–6.8 s，与 `sensorStart` 撞在一起，覆盖余量 −0.3 ~ +0.5 s；
+  等之后稳定在 +6.9 ~ +7.0 s
+- 关闭：`--no-h10` 或 `CAPTURE_H10=0`
+- `capture_linux.py` 的雷达部分原样拆成 `_capture_radar()`，
+  **采集时序（fpga→record→start_record→cfg→stop）一字未动**
+
+新入库 `scripts/h10_logger.py`（只存原始字节 + 双时钟，解析离线做），加四个开关，默认全关 = 旧行为：
+
+- `--reconnect`：断线不退出，重扫重连，全部记在同一个文件
+- `--remove-bond`：每次建连前 `bluetoothctl remove`。**已绑定连接上的首次 PMD 启动
+  固定晚约 30 s**（09-28–29 实测 22 次无例外），删绑定后 0.3 s。机理在 H10 固件，不再深挖
+- `--parent-pid`：父进程没了自行停止，防孤儿
+- `--exit-grace`：收到停止后的收尾上限，超时 fsync 后自退
+- EV 改名：结束时 Pi 主动断开记 `disconnected_at_end`，`disconnected` 只表示**意外**断开
+  （V1 教训：旧版两者都记 `disconnected`，"意外断开 = 0"的判据字面上满足不了）
+
+语音新增 4 个：`h10_connected` / `h10_lost` / `h10_reconnected` / `h10_missing`，
+用最高音区与雷达提示区分（`sounds/` 现共 15 个 wav）。断线时雷达照常采集。
+
+新增 `scripts/_test_h10_session.py`：假 logger 离线自检 7 个场景，Pi 上走真信号全过。
+
+### 验证（2026-10-09，iPhone 热点 5 GHz，判据测前写定、测后不改）
+
+| 轮次 | 内容 | 结果 |
+|---|---|---|
+| V2 首轮 | 3 段 × 5 min | **不过**：V2-1 判据写错（csv 本来就是 UNKNOWN）；V2-6 覆盖余量 −0.3 s → 改代码"等首个 PMD" |
+| V2 重做 | 3 段 × 5 min，条件同首轮 | V2-1..9 全过，雷达七项判据零影响 |
+| V2-R | `bluetoothctl disconnect` 后重连、再走出范围 | 断开到重连后首帧 8.1 s / ≤ 18.5 s，删绑定 rc=0，语音正确 |
+| V3 | 冷启动 → systemd → 一段 ESC 中止 + 一段正常 → POWER 退出 | 7 项全过，ABORT 段 H10 日志正确归档，退出后无残留 |
+
+### ★ 前提：Pi WiFi 必须在 5 GHz
+
+09-28 实测：2.4 GHz WiFi 开着时 BLE 建连 15/15 失败（HCI 0x3e），改 5 GHz 后正常。
+10-08 测试 2 不过就是因为 Pi 开机时 5G 连不上、静默回落到 2.4G（建连失败 373 次）；
+10-09 换 5G 重跑全过（失败 2 次）。
+
+### 修掉的分类 bug
+
+自己 killpg 之后 rc 也是 −9，被误记成"被 timeout 终止"。已加 killed 标志区分（Pi 上实测发现）。
+
+### 配置
+
+`cow_vitalsigns.cfg` 与 `dca1000_vitalsigns.json` 帧数改回 600（30 s），两处一致，供下一轮实验 1。
+
+### 验证期间暴露、与 H10 无关的两个现场问题（未解决）
+
+1. **开机后第一段 SSD 首次挂载掉线**：采集程序首次访问 `/mnt/pssd` 触发 automount，
+   同一秒 SSD 在 USB 3 上掉线，`os.makedirs` 报 `Errno 19`，播"采集失败"；再按一次就好。
+   嫌疑是供电（`throttled=0x50000`、每段开始都报欠压、`usb_max_current_enable=0`），
+   但掉线那一秒没有欠压记录，**未坐实**。exFAT"未正常卸载"出现 2 次（直接拔电所致）。
+2. **Pi 冷启动后雷达串口零回显**（见过 1 次）：29 条命令无回显，DCA1000 亮 `LVDS_PATH_ERR`。
+   只重上 DCA1000 无效，**重上 ICBOOST 5V 电**恢复。根因（上电时序）未查。
+
+文档同步：OPERATION / SETUP / TECHNICAL（新增第十节）/ TROUBLESHOOTING（新增第六节）/ README。
+`daemon_ready.wav` 的实际内容是"守护进程已启动"，文档里原写的"设备就绪"一并改掉。
+
+---
+
 ## 2026-09-06
 
 ### 遥控采集 + 语音提示 + 开机自启（已实测通过）
@@ -511,3 +585,8 @@ TI 只在 Ubuntu 16.04 **x86_64** 上测过，这两个问题在 ARM64 上必然
   封盒后这是唯一能看见状态的途径（DCA1000 面板灯也被盒子挡住）
 - 封盒与防水
 - 考虑把 SSD 格成 ext4（有日志，掉电更安全，且不再需要 `-Z`）
+- **SSD 首次挂载掉线**的处置（供电排查 / 开机即挂载 / 去掉 automount 的 idle-timeout），方案待定
+- **冷启动后雷达串口零回显**的根因（上电时序）
+- 心率带：等首个 PMD 最长实测 8.6 s，离 10 s 上限只差 1.4 s，牛场若常超时需再议
+- 心率带：未标定 BLE 批量延迟与 pcap 首包相对真实 chirp 的延迟（需敲击对时）
+- 心率带："WiFi 开着但没连上任何网络"工况下的 BLE 未测

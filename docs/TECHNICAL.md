@@ -607,3 +607,148 @@ unit 必须显式 `SupplementaryGroups=input audio dialout …`，
 
 遥控改动**没碰计时机制**，只把 `time.sleep(1)` 换成 `Event.wait(1)`
 （计时等价，只是可被 `ESC` 打断）。
+
+---
+
+## 十、心率带 H10
+
+### 为什么接到 Pi 上
+
+人体实验与牛场都需要逐拍心跳真值（牛场也给牛戴 H10）。手机 App 导出的 RR 本身准，
+但各文件时间从 0 起算、只有秒级绝对时刻，**无法与雷达做亚秒同步**。
+接到 Pi 上之后，H10 通知的到达时刻与 pcap 包时刻用的是**同一个 Pi 时钟**，这是唯一理由。
+
+不用 Polar SDK：HR 是标准 GATT（0x2A37），ECG/ACC 走 Polar PMD 服务，
+协议依据是 Polar 官方 `online_measurement.pdf`（PMD UUID、控制点命令、测量类型、设置格式）。
+文档没写、按社区实现推断的两处见 `h10_logger.py` 文件头。
+
+### 日志格式：只存原始字节 + 双时钟
+
+```
+<CLOCK_REALTIME ns> <CLOCK_MONOTONIC ns> <来源> <十六进制原始字节>
+来源：HR / PMD / CP_TX / CP_RX / EV
+```
+
+与 pcap 同一原则：解析可以重做，丢掉的字节回不来。解析在 Windows 侧离线做。
+REALTIME 与 tcpdump 的时间戳同源；MONOTONIC 不受 NTP 调时影响，两者之差跳变说明采集中被调过钟。
+
+**这是 Pi 收到通知的时刻，不是传感器采样时刻。** BLE 成批发送，中间隔着 BlueZ / D-Bus，
+批量延迟与抖动**未标定**（需敲击对时实验）。H10 自身时钟相对 Pi 漂移约 −190 ppm（实测）。
+
+### 结构：每段一个独立进程
+
+用户 2026-09-30 定的原则是"心率带必须独立于雷达采集进程"，具体落成：
+
+```
+capture() 过完自检
+  └─ h10_session.start()
+       timeout -k 20 -s INT <段长+缓冲+300> python3 -u h10_logger.py
+           --address <MAC> --log-path _h10_staging/h10_<时间>.log
+           --reconnect --remove-bond --parent-pid <雷达 PID> --exit-grace 10
+       start_new_session=True（自成进程组）
+  └─ wait_first_pmd()          最多 10 s
+  └─ 雷达 [1]–[5]
+  └─ [6] request_stop()        SIGINT，不等
+  └─ [7] finish(段目录)        限时回收，日志移进段目录
+```
+
+- **另一个进程组**：守护进程 killpg 雷达进程组时信号不会直接打到它；
+  它的崩溃、卡死、BLE 异常也碰不到雷达进程的内存与时序。
+- **三重兜底防孤儿**：logger 自己看护父 PID（`parent_gone`）；外层 `timeout -k` 限总时长并硬杀；
+  回收超过 `STOP_WAIT=25` 秒再 killpg SIGKILL。
+- **语音靠尾随日志的 EV 行**，不读子进程管道 —— 管道读不及会反过来卡死 logger。
+  logger 的终端输出写到同目录 `.stdout.txt`。
+- **所有公开方法吞掉异常**，只打印不抛；结果只写进 meta 的 H10 一节，**不进 checks、不影响 verdict**。
+- 回收与 `stop_record`（本来就要约 7 秒）并行，实际几乎不增加收尾时间。
+- 没有段目录可放（配 DCA1000 就失败）时归 `H10_ORPHAN/`；上次崩溃留在 `_h10_staging/` 的文件
+  下次 start 时移到 `H10_ORPHAN/`，不删。
+
+| 常量（`h10_session.py`） | 值 | 含义 |
+|---|---|---|
+| `FIRST_PMD_WAIT` | 10 s | 配 DCA1000 前最多等首个 PMD |
+| `MISSING_AFTER` | 45 s | 拉起后这么久没连上，播一次"心率带未连接" |
+| `EXIT_GRACE` | 10 s | logger 收到停止后自己的收尾上限，超时 fsync 后自退 |
+| `KILL_AFTER` | 20 s | `timeout -k`：转发停止信号后再过这么久 SIGKILL |
+| `STOP_WAIT` | 25 s | 雷达进程回收 H10 的最长等待，须 > `KILL_AFTER` |
+| `MAX_MARGIN` | 300 s | `timeout` 总时长 = 段时长 + 缓冲 + 这么多 |
+
+### ★ 已绑定连接的首次 PMD 启动固定晚约 30 秒
+
+2026-09-28–29 实测：在**已绑定**的连接上第一次启动 PMD（ECG/ACC），回应固定晚约 30 s，
+22 次无例外；**删绑定后现场配对只要 0.3 s**。同一连接内停了再启是 0.3 s；
+提前连好不抵消（从启动命令起算）。机理在 H10 固件里，用户决定不再深挖。
+
+处置：`--remove-bond`，每次建连前 `bluetoothctl remove <地址>`。
+设备本来就没绑定时它也报错（rc≠0），只记日志、不中断。
+
+### ★ 雷达开采前先等首个 PMD
+
+H10 从拉起到首个 PMD 要 6–9 s（扫描 + 建连 + 删绑定后配对 + PMD 启动），
+与雷达 `sensorStart` 几乎同时。不等的话两者撞在一起，
+V2 首轮实测 `h10_pmd_lead_sec` 三段在 −0.3 ~ +0.5 s，第 3 段雷达开头 0.3 s 没有心率带。
+
+改为配 DCA1000 前等首个 PMD，最多 `FIRST_PMD_WAIT=10` s，超时雷达照常开采。
+V2 重做实测等待 6.2 / 7.6 / 8.6 s，lead 稳定在 +6.9 ~ +7.0 s。
+**最长 8.6 s 离 10 s 上限只差 1.4 s**，牛场若常超时需再议。
+
+### EV 事件的语义
+
+| EV | 含义 |
+|---|---|
+| `connected` | 每次建连成功；第一条是首连，之后的是重连 |
+| `disconnected` | **意外**断开（采集中途） |
+| `disconnected_at_end` | 结束时 Pi 主动断开，**不算断线** |
+| `disconnected_by_host` | 出错后 Pi 主动断开，随后会重连 |
+| `session_error <说明>` | 连接期间出错（命令无回应、状态码非 0 等） |
+| `attempt <n>` / `scan_fail` | 第 n 次扫描+建连 / 没扫到 |
+| `bond_remove rc=<码>` | 删绑定的结果 |
+| `parent_gone` / `stop_signal` / `exit_forced` / `end` | 父进程没了 / 收到停止 / 收尾超时自退 / 正常结束 |
+
+`disconnected_at_end` 是 V1 的教训：旧版结束时也记 `disconnected`，
+"意外断开次数 = 0"这种判据字面上就满足不了。
+重复停止信号是幂等的 —— `timeout` 转发时会发两次 SIGINT。
+
+### 状态与 meta
+
+| `h10_status` | 条件 | `h10=` |
+|---|---|---|
+| `OK` | 连上、无意外断开、有 PMD | `OK` |
+| `DROPOUT` | 有意外断开 | `PARTIAL（意外断开 n 次）` |
+| `NO_PMD` | 连上了但没有 PMD | `PARTIAL（只有 HR，无 ECG/ACC）` |
+| `MISSING` | 一次都没连上 | `MISSING（H10 缺失）` |
+| `START_FAILED` | 进程没拉起来 | `MISSING（H10 进程未启动）` |
+| `DISABLED` | `--no-h10` / `CAPTURE_H10=0` | `DISABLED` |
+| `ERROR` | 收尾异常 | `ERROR` |
+
+meta 的 H10 一节还记：文件名与字节数、退出方式与 rc、连接 / 意外断开 / 扫描失败 / 建连失败 /
+会话错误次数、HR 与 PMD 通知条数、各次删绑定 rc、等首个 PMD 的结果，以及首连 / 首 HR /
+首 PMD / 末 PMD 的 REALTIME ns。
+
+`h10_pmd_lead_sec` = 雷达开始时刻 − 首个 PMD 到达时刻，`h10_pmd_tail_sec` = 末个 PMD − 雷达结束，
+**都应 ≥ 0**。雷达时刻取的是脚本记的开始/结束，不是首个 chirp —— pcap 首包与真实 chirp 的延迟**未标定**。
+
+退出方式里有一个分类细节：自己 killpg 之后 rc 也是 −9，必须用标志区分，
+否则会被误记成"被 timeout 终止"（Pi 上实测踩过）。
+
+### ★ 2.4 GHz WiFi 与 BLE 共存
+
+Pi 5 的 WiFi 与蓝牙共用一颗芯片和天线。2026-09-28 实测：2.4 GHz WiFi 开着时
+BLE 建连 15/15 失败（HCI 0x3e，Connection Failed to be Established），关 WiFi 首次成功，
+改 5 GHz 后 3/3 成功。
+
+10-08 测试 2 的对照：Pi 静默回落到 2.4G 后，首次建连用了 195 s、`connect_attempt_failed` 373 次；
+10-09 测试 2b 在 5G 下首次建连 2.95 s、失败 2 次。btmon 显示 5G 下仍偶发 0x3e，只是少得多。
+（这两次不是严格单变量对照，还换了热点和时段。）
+
+**"WiFi 开着但没连上任何网络"这一工况下的 BLE 未测。**
+
+### 验证记录（2026-10-09，iPhone 热点 5 GHz）
+
+| 轮次 | 内容 | 结果 |
+|---|---|---|
+| V2 重做 | 3 段 × 5 min，与雷达并行，前台 `--remote` | V2-1..9 全过；雷达七项判据零影响 |
+| V2-R | `bluetoothctl disconnect` 后重连、再走出范围 | 断开到重连后首帧 8.1 s / ≤ 18.5 s；语音正确 |
+| V3 | 冷启动 → systemd 服务（`User=pi`）→ 一段 ESC 中止 + 一段正常 → POWER 退出 | 7 项全过；ABORT 段 H10 日志正确归档；退出后无残留进程 |
+
+H10 数据本身的质量判据（RR 与 ECG R 峰对齐）在 Windows 侧离线做，三段全过。
+注意 H10 的 **R 波是负向的**，只找正峰的检测器会大量漏检；牛的 R 波形态未知，检测器必须自适应极性。

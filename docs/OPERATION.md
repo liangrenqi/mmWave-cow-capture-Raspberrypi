@@ -15,6 +15,7 @@
 | DCA1000 电源 | 5V | — |
 | 2.4G 遥控器接收器 | 任意 USB 口 | Genius 演示器，`27a7:2501`。枚举出 4 个 event 节点 |
 | USB 喇叭 | 任意 USB 口 | ALSA 名 `Device`，**按名字选卡不按编号**（编号会变） |
+| Polar H10 心率带 | 无线（BLE），无需接线 | 按 MAC `24:AC:AC:11:CC:D4` 连接（广播不带名字）。**必须佩戴、电极湿润**，干放不广播 |
 
 **"断电重启雷达"指拔 5V 桶插头，等 5 秒，插回。** 只拔 USB 不会复位 6843。
 
@@ -37,6 +38,10 @@ export LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH
 # 4. 雷达是否在应答 ★ 最重要
 python3 scripts/probe_radar.py
 #   应回 12 行版本信息 + Done
+
+# 5. WiFi 频段（采心率带时必查）
+nmcli -t -f ACTIVE,SSID,FREQ dev wifi | grep ^yes
+#   FREQ 应为 5xxx MHz；2.4 GHz（24xx）下 H10 建连大量失败
 ```
 
 第 2、3 步即使忘了也没关系 —— `capture_linux.py` 的第 0 步会自检并自动修正
@@ -44,6 +49,12 @@ python3 scripts/probe_radar.py
 那时任何结论都不可信（不是配置问题，是固件没跑）。
 
 第 4 步返回 0 字节 → 见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md#雷达串口完全静默)。
+冷启动后见过一次零回显（DCA1000 同时亮 `LVDS_PATH_ERR` 红灯），
+**重上 ICBOOST 的 5V 电**即恢复，只重上 DCA1000 无效。
+
+第 5 步是 2026-09-28 实测：2.4 GHz WiFi 开着时 BLE 建连 15/15 失败（HCI 0x3e），
+改 5 GHz 后正常。Pi 开机若连不上 5G，NetworkManager 会自动回落到 2.4G，
+所以每次都要看，不能只看一次。
 
 ## 三、遥控采集（封盒后的主用方式）
 
@@ -58,26 +69,33 @@ ESC         →  紧急中止本段
 ```
 
 `POWER` 管"程序开关"，`ENTER`/`ESC` 管"采集开关"。
-所以饲养员只需记两件事：**开机听到"设备就绪"→ POWER 双击 → ENTER 双击采一段。**
+所以饲养员只需记两件事：**开机听到"守护进程已启动"→ POWER 双击 → ENTER 双击采一段。**
 
 ### 完整流程与语音
 
 | 操作 | 语音 | 说明 |
 |---|---|---|
-| 上电开机 | "设备就绪" | 守护进程自启完成，**什么命令都不用敲** |
+| 上电开机 | "守护进程已启动" | 守护进程自启完成（`daemon_ready.wav`），**什么命令都不用敲** |
 | `POWER` × 2 | "采集程序启动" | 拉起采集程序 |
 | `ENTER` × 2 | "采集命令下发" | **立刻响**，告诉你命令收到了 |
-| （等 10–20 秒） | "采集开始" | 雷达真正开始发射 |
+| （约 1–3 秒） | "心率带已连接" | H10 连上；45 秒仍未连上则播一次"心率带未连接" |
+| （等 15–30 秒） | "采集开始" | 雷达真正开始发射 |
 | （采集时长） | — | 此时 `ENTER` 被锁定，防误触 |
 | 采完 | "通过" / "判废" | 7 项判据的结论 |
 | （1.5 秒后） | "可以采集" | 回到待命，可采下一段 |
 | `ESC`（采集中） | "已中止" | 归档到 `ABORT_` 目录，不跑判据 |
 | `POWER` × 2（空闲时） | "采集程序退出" | 回到守护待命 |
 | `POWER` × 2（采集中） | "采集进行中，请先按返回键中止" | **被拒绝**，先按 `ESC` |
+| （采集中心率带掉线） | "心率带断开" | 自动重连，**雷达照常采集，本段不作废** |
+| （重连成功） | "心率带已重连" | — |
 
-**"采集命令下发"和"采集开始"之间那 10–20 秒是正常的** ——
-要跑 preflight、配 FPGA、起 tcpdump、起 CLI_Record、下发 29 条 cfg、
-等 `sensorStart` 裁决。听到第一句就说明按上了，**不要重复按**。
+**"采集命令下发"和"采集开始"之间那 15–30 秒是正常的** ——
+要跑 preflight、拉起心率带并等它出第一包 ECG/ACC（最多 10 秒，实测 6–9 秒）、
+配 FPGA、起 tcpdump、起 CLI_Record、下发 29 条 cfg、等 `sensorStart` 裁决。
+听到第一句就说明按上了，**不要重复按**。
+
+心率带的四条语音只是提示"去看一下心率带"，**都不影响雷达判定**。
+心率带的情况只记在 `capture_meta.txt` 的 `h10=` 一行里，见下文第五节"心率带这段全不全"。
 
 ### 开机自启已装好，日常无需任何命令
 
@@ -100,7 +118,7 @@ journalctl -u radar-remote -f         # 看实时日志（排查时才用）
 
 ### 音频文件
 
-`~/mmwave-cow-capture/sounds/` 下 11 个 wav。**文件名即内容**，
+`~/mmwave-cow-capture/sounds/` 下 15 个 wav（采集 7 + 守护 4 + 心率带 4）。**文件名即内容**，
 换成自己录的同名覆盖即可，代码不用改（16-bit PCM / 44.1 kHz / 单声道）。
 
 ```bash
@@ -108,10 +126,11 @@ python3 scripts/_test_audio.py            # 按实际顺序播一遍，验证喇
 python3 scripts/_test_audio.py --gen      # 生成占位音（纯合成，无需录音）
 ```
 
-采集程序用中高音区，守护进程用低音区 —— 刻意区分，听一下就知道
-当前是"程序开关"还是"采集开关"。
-注意 `daemon_ready.wav`（"设备就绪"，整台设备待命）与
+采集程序用中高音区，守护进程用低音区，心率带用最高音区（1300–2000 Hz 短促音）——
+刻意区分，听一下就知道是哪一层在说话。
+注意 `daemon_ready.wav`（"守护进程已启动"，整台设备待命）与
 `ready.wav`（"可以采集"，采集程序空闲）**语义不同**，录音措辞别都念"就绪"。
+`--gen` 只生成缺失的文件，已录好的真人语音不会被覆盖（`--force` 才覆盖）。
 
 ### 遥控器按键与实际键码
 
@@ -143,6 +162,9 @@ python3 scripts/remote_daemon.py --check  # 自检设备、logind、音频
 **副作用：Pi 板载电源按钮短按也不再关机**（同样带那个标签）。
 关机改用 `sudo poweroff`；桌面菜单的关机走 D-Bus，不受影响。
 
+**断电前尽量先 `sudo poweroff`。** 直接拔电会让 exFAT 卷标记"未正常卸载"
+（2026-10-09 已出现 2 次），积累下去有丢文件的风险。
+
 ## 四、手动采集（调试用）
 
 ```bash
@@ -155,7 +177,13 @@ python3 scripts/capture_linux.py --no-pcap          # 不抓 pcap（不推荐）
 python3 scripts/capture_linux.py --no-verify        # 跳过 L3（现场省时间）
 python3 scripts/capture_linux.py --mode vitalsigns --remote   # 遥控模式
 python3 scripts/capture_linux.py --remote --no-audio          # 遥控但静音
+python3 scripts/capture_linux.py --no-h10           # 本次不采心率带
+CAPTURE_H10=0 python3 scripts/capture_linux.py      # 同上，环境变量形式
 ```
+
+心率带默认随段采集。启动时屏幕上"心率带H10"一行会显示开/关。
+H10 不在身边或没佩戴时不必关：它连不上只会播一次"心率带未连接"，雷达照常采。
+但那样每段都会多等 10 秒（等首个 PMD 超时），整轮不用时建议关掉。
 
 **调试遥控功能时先停守护进程**，否则两个进程会抢同一个输入设备：
 
@@ -180,15 +208,18 @@ sudo systemctl start radar-remote
 
 ```
 [0] 采集前自检     内核缓冲、落盘目录可写与余量、eth0 IP
+    心率带         拉起 h10_logger（独立进程），等首个 PMD，最多 10 秒
 [1] 配置 DCA1000   fpga → record
 [2] 启动抓包       tcpdump，-B 按码率自动算
 [3] 启动录制       start_record（必须 -q）
 [4] 发送 cfg       31 条命令逐行下发，每条回 Done
 [5] 等待           采集时长 + 10 秒封口缓冲
-[6] 停止           stop_record（必然报 -4068，属正常）→ 停 tcpdump
-[7] 整理           文件移入会话目录
-[8] 判定           7 项判据 → GOOD / BAD / UNKNOWN
+[6] 停止           给心率带发停止信号（不等）→ stop_record（必然报 -4068，属正常）→ 停 tcpdump
+[7] 整理           文件移入会话目录，心率带日志一起移入
+[8] 判定           7 项判据 → GOOD / BAD / UNKNOWN（心率带不参与）
 ```
+
+自检失败的段不会拉起心率带，所以不会产生多余的心率带文件。
 
 `stop_record` 报 `-4068 Timeout Error` 是 **TI 的设计缺陷，不是故障**，
 数据此时已全部落盘。详见 [TECHNICAL.md](TECHNICAL.md#stop_record-必然超时)。
@@ -223,6 +254,24 @@ check.csv            = UNKNOWN（infinite 模式不产出，已放弃）
 
 **csv 那项永远是 UNKNOWN，不影响结论。** 六项 PASS 即为成功。
 
+### 心率带这段全不全
+
+```bash
+grep -E "^h10=|^h10_status|^h10_pmd_(lead|tail)_sec" <session_dir>/capture_meta.txt
+```
+
+| `h10=` | 含义 |
+|---|---|
+| `OK` | 全程连着，有 ECG/ACC |
+| `PARTIAL（意外断开 n 次）` | 中途掉线过，已自动重连，掉线期间无数据 |
+| `PARTIAL（只有 HR，无 ECG/ACC）` | 连上了但 PMD 流没起来 |
+| `MISSING（H10 缺失）` | 整段没连上（没戴、电极干、WiFi 在 2.4G） |
+| `MISSING（H10 进程未启动）` | logger 没拉起来，看 `h10_note` |
+| `DISABLED` | 本次用 `--no-h10` 或 `CAPTURE_H10=0` 关了 |
+
+`h10_pmd_lead_sec` / `h10_pmd_tail_sec` 是心率带数据覆盖雷达窗口的余量，
+**都应 ≥ 0**（正常约 +7 / +10 秒）。负数表示雷达开头或结尾有一截没有心率带。
+
 ### 批量筛选
 
 ```bash
@@ -243,14 +292,20 @@ grep -H "^check.rx_channels=" /mnt/pssd/Ti_radar_data/*/capture_meta.txt
 - [ ] SOP 跳线 `001`，S1 拨码 OFF/ON/ON/OFF/OFF
 - [ ] 5V 与 USB 都已连接，网线插好
 - [ ] 遥控器接收器与 USB 喇叭已插上
-- [ ] **上电后听到"设备就绪"** ← 守护进程自启成功的唯一现场判据
+- [ ] **上电后听到"守护进程已启动"** ← 守护进程自启成功的唯一现场判据
 - [ ] `probe_radar.py` 回 `Done`（封盒后做不了，改用上一条）
 - [ ] 落盘盘余量够（一段行为 4.4 GB，含 pcap）
 - [ ] 若上一段是另一种波形 → **已断电重启**
+- [ ] H10 已佩戴、电极湿润
+- [ ] Pi WiFi 在 5 GHz（开机热点校时后再确认一次）
+
+开机后的**第一段**若听到"采集失败"，可能是移动 SSD 首次挂载时掉线
+（2026-10-09 见过一次，疑供电，未坐实）。程序已回到待命、无残留，**直接再按一次 ENTER × 2**。
 
 采集**后**（每段都看）：
 
 - [ ] **听到"通过"而不是"判废"** ← 封盒后的主要判据
+- [ ] 本段只听到一次"心率带已连接"，没有"断开"/"未连接"
 - [ ] `verdict=GOOD`，目录名无 `BAD_`（回实验室核）
 - [ ] `check.rx_channels=PASS` ← **四路都有信号,少一路数据废掉且不会报错**
 - [ ] 记下牛号与备注（改脚本顶部 `COW_ID` / `NOTE`）
@@ -275,8 +330,16 @@ done
     cow_behavior_Raw_2.bin
     cow_behavior_<时间戳>.pcap    含每包序号与微秒时间戳
     cow_behavior_Raw_LogFile.csv  0 字节（已知，见技术文档）
-    capture_meta.txt              判定 + 全部采集参数
+    capture_meta.txt              判定 + 全部采集参数 + 心率带一节
+    h10_<时间戳>.log              心率带原始字节 + 双时钟（离线解析）
+    h10_<时间戳>.log.stdout.txt   心率带进程的终端输出，排查用
+
+<落盘目录>/_h10_staging/          采集中心率带日志先写这里，段结束移走，平时应为空
+<落盘目录>/H10_ORPHAN/            没有段目录可放的心率带日志（准备阶段就失败、上次崩溃遗留）
 ```
+
+心率带日志在正常、`BAD_`、`ABORT_` 三种段目录里都有。
+`H10_ORPHAN/` 里的文件不删，可以手动对照时间归档或丢弃。
 
 **bin 和 pcap 都要保留** —— 验证期两份都是判据的一部分。
 pcap 能转 bin，bin 无法还原 pcap，转换是不可逆的信息丢失。

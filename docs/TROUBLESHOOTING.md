@@ -25,6 +25,12 @@
    所以"USB 枚举正常"完全不能说明 6843 有电。看板上电源 LED。
 3. **雷达处于死锁**（见下一条）。断电重启。
 4. 端口被占（见 ModemManager 一条）。`sudo fuser -v /dev/ttyACM0` 查。
+5. **Pi 冷启动后零回显**（2026-10-09 见过 1 次）：29 条命令一条回显都没有，
+   DCA1000 同时亮 `LVDS_PATH_ERR` 红灯（TI 文档：雷达没发 LVDS 数据）。
+   只重上 DCA1000 的电无效；**重上 ICBOOST 的 5V 电**后 XDS110 重新枚举，
+   之后 `sensorStart` 正常并出现 `Init Calibration` 行。
+   根因（上电时序）**未查**。牛场上电自启若复现，整天都会白采 ——
+   开机后第一段务必确认听到"采集开始"而不是"采集失败"。
 
 **区分手段**：`probe_radar.py` 会打印 USB runtime power 状态。
 若 `runtime_status=suspended` 是 autosuspend 问题；若显示 `active` 但仍静默，
@@ -167,6 +173,39 @@ bin 完整落盘。那次判 BAD 是 pcap 拖累的。
 `capture_linux.py` 的 `preflight()` 每次采集自检并**自动修正**。
 
 若自检报 `[FAIL]`，手工执行提示里给的 `sysctl -w` 命令。
+
+---
+
+### 开机后第一段报"采集失败"：OSError Errno 19 No such device
+
+**症状**：开机后第一次 `ENTER` × 2 直接播"采集失败"然后回到"可以采集"；
+终端或 journal 里是 `os.makedirs` 处的 `OSError: [Errno 19] No such device`。
+再按一次就正常。
+
+**经过**（2026-10-09 实测，journal + dmesg 对得上）：采集程序第一次访问 `/mnt/pssd`
+触发 systemd automount，同一秒移动 SSD 在 USB 3 总线上掉线（`usb 2-1: USB disconnect`），
+mount 读不到 superblock；0.6 s 后 SSD 重新枚举成功。
+
+**嫌疑是供电，未坐实**：`vcgencmd get_throttled` = `0x50000`（开机以来欠压过 + 降频过），
+每段开始都报欠压，`usb_max_current_enable=0`，USB 上挂着 SSD + XDS110 + 遥控接收器 + 喇叭；
+但掉线那一秒内核**没有**报欠压。
+
+**影响**：程序处理是对的 —— 报错、回到待命、未拉起心率带、无残留。
+但封盒后饲养员只会听到"采集失败"。另外 automount 的 `idle-timeout=600`
+意味着空闲 10 分钟会卸载，下一段又要首次挂载。
+
+**现场处置**：再按一次 `ENTER` × 2。根本处置（供电、挂载方式）待定。
+
+---
+
+### exFAT 卷"未正常卸载"
+
+**症状**：dmesg 里 `exFAT-fs ... Volume was not properly unmounted`。
+
+**根因**：直接拔电。2026-10-09 已出现 2 次。积累下去有丢文件的风险。
+
+**处置**：断电前 `sudo poweroff`（板载电源键已被屏蔽，见第五节）。
+回实验室时在 Windows 上对该盘做一次磁盘检查。长期看建议格 ext4。
 
 ---
 
@@ -449,7 +488,66 @@ cat ~/mmwave-cow-capture/scripts/.remote_state    # 状态 / 时间戳 / PID
 
 ---
 
-## 六、快速诊断命令
+## 六、心率带 H10
+
+**总原则**：心率带的任何故障都**不判废雷达段**，只记在 meta 的 `h10=` 与 `h10_*` 里。
+所以下面这些问题都不会让你听到"判废"，只会听到心率带的语音，或回实验室看 meta 才知道。
+
+### 一直"心率带未连接" / `h10=MISSING（H10 缺失）`
+
+按可能性排查：
+
+1. **WiFi 在 2.4 GHz** ★ 最常见。2.4G 下 BLE 建连大量 0x3e 失败（实测 15/15）。
+   ```bash
+   nmcli -t -f ACTIVE,SSID,FREQ dev wifi | grep ^yes     # FREQ 应为 5xxx
+   ```
+   Pi 开机时 5G 连不上会**静默回落**到 2.4G（2026-10-08 实测：路由器 5G 没广播）。
+   测试类结论之前必须先核频段，否则测的是共存问题，不是代码。
+2. **没戴或电极干**。H10 干放不广播，未贴胸不发 PMD。
+3. **地址不对**。按 MAC 连，不按名字（广播可以不带名字）。换带子要改 `H10_ADDRESS`。
+4. **离得太远**。BLE 实际距离受身体遮挡影响大。
+
+### `h10=MISSING（H10 进程未启动）` / `h10_status=START_FAILED`
+
+看 meta 的 `h10_note` 与段目录里的 `.stdout.txt`：
+
+- `ModuleNotFoundError: bleak` → bleak 没装，或服务不是 `User=pi`（bleak 是用户级安装）
+- `找不到 h10_logger.py` → `scripts/` 下缺文件，或 `H10_LOGGER` 环境变量指错
+
+### `h10=PARTIAL（意外断开 n 次）`
+
+中途掉线，已自动重连（重连前删绑定）。掉线期间没有数据，分析时要按 EV 行切开。
+2026-10-09 实测断开到重连后首帧 8–18 s（含 3 s 重试间隔）。
+偶发可接受；频繁的话先查 WiFi 频段与佩戴。
+
+### `h10=PARTIAL（只有 HR，无 ECG/ACC）`
+
+连上了但 PMD 流没起来。看日志里的 `CP_RX` 行（控制点回应）与 `session_error` EV。
+已绑定连接上第一次启动 PMD 会晚约 30 秒，正常流程每次建连前删绑定绕开了它；
+若 `bond_remove rc` 非 0 且设备确实绑定着，就可能踩到这个。
+
+### `h10_pmd_lead_sec` 为负
+
+雷达开头有一截没有心率带。正常流程雷达开采前会等首个 PMD 最多 10 秒，
+看 `h10_wait_first_pmd`：若是"10 s 未见 PMD，超时"，说明那次 H10 起得慢。
+实测正常等待 6–9 s，离上限只有 1–4 s 余量。
+
+### `H10_ORPHAN/` 里有文件
+
+没有段目录可放的心率带日志：配 DCA1000 前就失败，或上次崩溃遗留在 `_h10_staging/`
+（下次 start 时自动移过来）。不会自动删，按时间对照归档或丢弃。
+
+### 退出后还有 h10_logger 进程
+
+不应该发生（三重兜底：父 PID 看护、`timeout -k`、回收超时 SIGKILL）。
+```bash
+pgrep -af h10_logger          # 应为空
+```
+若真有，`pkill -INT -f h10_logger` 让它正常收尾，并保留它的日志排查。
+
+---
+
+## 七、快速诊断命令
 
 ```bash
 # 雷达在应答吗
@@ -508,11 +606,31 @@ cat ~/mmwave-cow-capture/scripts/.remote_state
 
 # unit 语法（放错段的键会被静默忽略）
 systemd-analyze verify /etc/systemd/system/radar-remote.service
+
+# ---- 心率带 H10 ----
+
+# WiFi 频段（必须 5xxx）
+nmcli -t -f ACTIVE,SSID,FREQ dev wifi | grep ^yes
+
+# H10 进程有没有残留
+pgrep -af h10_logger
+
+# 本段心率带结论与覆盖余量
+grep -E "^h10=|^h10_(status|note|exit|pmd_lead_sec|pmd_tail_sec|wait_first_pmd)" <session_dir>/capture_meta.txt
+
+# 离线自检（假 logger，不需要 H10）
+python3 scripts/_test_h10_session.py
+
+# ---- 供电与 SSD ----
+
+# 欠压/降频历史（0x50000 = 开机以来欠压过 + 降频过）
+vcgencmd get_throttled
+journalctl -k -b | grep -iE "under-voltage|usb 2-1|exfat"
 ```
 
 ---
 
-## 七、几条容易误判的经验
+## 八、几条容易误判的经验
 
 | 现象 | 不是故障 |
 |---|---|
@@ -524,7 +642,11 @@ systemd-analyze verify /etc/systemd/system/radar-remote.service
 | 采集后 `/proc/net/udp` 读不到 | socket 已关闭，必须采集期间轮询 |
 | DCA1000 灯采完后不闪 | 雷达已停止出流，封口缓冲期无数据 |
 | 满量程只用 5% | 可能是场景，软件判不了 |
-| 双击到"采集开始"隔 10–20 秒 | 要跑自检、配卡、起进程、发 29 条 cfg、等 sensorStart |
+| 双击到"采集开始"隔 15–30 秒 | 要跑自检、等心率带首个 PMD（≤10 s）、配卡、起进程、发 29 条 cfg、等 sensorStart |
+| meta 里 `disconnected_at_end` | 结束时 Pi 主动断开，不算断线；意外断开才记 `disconnected` |
+| `bond_remove rc` 非 0 | 设备本来就没绑定时 `bluetoothctl remove` 也报错，正常 |
+| 心率带断了但雷达段判"通过" | 设计如此，心率带不参与判定 |
+| 开机后第一段"采集失败"，再按就好 | SSD 首次挂载掉线（疑供电），见第二节 |
 | 采集中按 POWER 退不出 | 设计如此，防止雷达不停 + 游离文件卡死下次采集 |
 | 采集中按 ENTER 无反应 | 开始键已锁定，防误触 |
 | 按住按键不放没反复触发 | `value==2`（长按重复）被有意忽略 |
