@@ -117,7 +117,9 @@ class Notifier:
     """
 
     EVENTS = ("ready", "armed", "preparing", "start", "locked", "aborting",
-              "finalizing", "done_good", "done_bad", "done_abort", "error")
+              "finalizing", "done_good", "done_bad", "done_abort", "error",
+              # 心率带 H10（h10_session.py 发出，2026-09-30 用户要求断线/重连都要播报）
+              "h10_connected", "h10_lost", "h10_reconnected", "h10_missing")
 
     def emit(self, event, detail=""):
         raise NotImplementedError
@@ -144,6 +146,10 @@ class LogNotifier(Notifier):
         "done_bad":   "本段判定 BAD",
         "done_abort": "已中止，数据已归档",
         "error":      "出错",
+        "h10_connected":   "心率带已连接",
+        "h10_lost":        "心率带断开",
+        "h10_reconnected": "心率带已重连",
+        "h10_missing":     "心率带未连接",
     }
 
     # 音频文件映射 —— 只在关键节点播放,减少干扰
@@ -170,6 +176,16 @@ class LogNotifier(Notifier):
         "done_bad":   "done_bad.wav",
         "done_abort": "done_abort.wav",
         "error":      "error.wav",
+        # 心率带。录音建议：
+        #   h10_connected.wav    - "心率带已连接"
+        #   h10_lost.wav         - "心率带断开"
+        #   h10_reconnected.wav  - "心率带已重连"
+        #   h10_missing.wav      - "心率带未连接"（拉起 45 秒仍没连上，只播一次）
+        # 断线时雷达照常采集，这几条只是告诉饲养员「去看看心率带」，不代表本段作废
+        "h10_connected":   "h10_connected.wav",
+        "h10_lost":        "h10_lost.wav",
+        "h10_reconnected": "h10_reconnected.wav",
+        "h10_missing":     "h10_missing.wav",
     }
 
     def emit(self, event, detail=""):

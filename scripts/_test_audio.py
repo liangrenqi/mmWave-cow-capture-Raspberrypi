@@ -20,6 +20,7 @@
   done_bad    两声下行（不妙）
   done_abort  一长一短
   error       快速三连低音
+  h10_*       心率带四个事件，统一用最高音区（连接 / 断开 / 重连 / 未连接）
 
 生成的 wav 是 16-bit PCM / 44.1 kHz / 单声道，aplay 直接支持。
 录真人语音时用同样格式覆盖同名文件即可，代码不用改。
@@ -109,6 +110,21 @@ PLACEHOLDER = {
                                  + tone(233, 100) + silence(45)
                                  + tone(233, 100) + silence(45)
                                  + tone(233, 100)),
+
+    # ---- 心率带 H10（h10_session.py）----
+    # 用**最高音区**（1300–2000 Hz 的短促音），与上面两套都区分开：
+    # 一听是"尖的"就知道说的是心率带，不是雷达。
+    "h10_connected.wav":   lambda: (tone(1320, 90) + silence(50)
+                                    + tone(1760, 140)),
+    "h10_lost.wav":        lambda: (sweep(1980, 1180, 260) + silence(90)
+                                    + sweep(1980, 1180, 260)),
+    "h10_reconnected.wav": lambda: (sweep(1180, 1980, 220) + silence(60)
+                                    + tone(1760, 90) + silence(40)
+                                    + tone(1760, 90)),
+    "h10_missing.wav":     lambda: (tone(1480, 80) + silence(70)
+                                    + tone(1480, 80) + silence(70)
+                                    + tone(1480, 80) + silence(70)
+                                    + tone(1100, 260)),
 }
 
 
@@ -210,6 +226,12 @@ def main():
         [(e, cap_map.get(e)) for e in
          ("preparing", "start", "done_good", "done_bad",
           "done_abort", "error", "ready")])
+
+    print()
+    missing += play_group(
+        "心率带 H10（最高音区，与雷达区分）",
+        [(e, cap_map.get(e)) for e in
+         ("h10_connected", "h10_lost", "h10_reconnected", "h10_missing")])
 
     # 守护进程的事件（remote_daemon.py）。import 放这里而不是文件顶部：
     # 只有这一处用得到，且它会 import evdev，没插遥控器时不该拖累纯音频测试。

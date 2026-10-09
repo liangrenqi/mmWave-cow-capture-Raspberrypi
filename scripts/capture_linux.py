@@ -46,6 +46,12 @@ try:
 except ImportError:
     remote_control = None
 
+# 心率带 H10：独立进程，缺了这个模块雷达照常采（只是不采心率带）
+try:
+    import h10_session
+except ImportError:
+    h10_session = None
+
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -98,6 +104,10 @@ ABORT_SETTLE_SEC = 3             # 中止时给 DCA1000 吐完在途数据的时
 # 超了不报错、静默回绕（见 check_consistency 的注释）。
 MAX_FRAMES = 65535               # rl_sensor.h:963  "Valid Range 0 to 65535"
 MAX_LOOPS = 255                  # rl_sensor.h:958  "valid range = 1 to 255"
+
+# 心率带 H10 随段采集（独立进程，见 h10_session.py）。
+# 关掉：--no-h10，或环境变量 CAPTURE_H10=0（整轮都不要时设一次即可）
+H10_ENABLED = os.environ.get("CAPTURE_H10", "1").strip().lower() not in ("0", "no", "off", "false")
 
 # 现场标注
 COW_ID = "UNKNOWN"
@@ -896,7 +906,7 @@ def send_sensor_stop(timeout=3.0):
 
 def abort_capture(jc, fc, pcap_proc, rec_proc, dropmon, t0, reason,
                   notifier=None, settle_sec=ABORT_SETTLE_SEC,
-                  use_pcap=True, serial_errs=None):
+                  use_pcap=True, serial_errs=None, h10=None):
     """中止收尾 —— 停止键与 Ctrl-C 走这同一条路
 
     与正常收尾（_run 的 [6][7][8]）的三处区别：
@@ -928,6 +938,10 @@ def abort_capture(jc, fc, pcap_proc, rec_proc, dropmon, t0, reason,
     # ① 让雷达真的停下来。放在最前面 —— 每晚一秒就多空转一秒。
     stop_ok, stop_reply = send_sensor_stop()
 
+    # H10 只发停止信号、不等，它与下面的 settle/stop_record 并行收尾
+    if h10 is not None:
+        h10.request_stop()
+
     # ② 给 DCA1000 一点时间把在途数据推完再关记录，避免 pcap 断在半包
     print(f"  -> 等待 {settle_sec:.0f} 秒让在途数据落地 ...")
     time.sleep(settle_sec)
@@ -957,9 +971,13 @@ def abort_capture(jc, fc, pcap_proc, rec_proc, dropmon, t0, reason,
     if not moved:
         # 准备阶段就中止、雷达还没出流时是正常的
         print("  -> 没有产生任何数据文件（中止得早），无需归档")
+        if h10 is not None:             # 没有雷达目录可放，H10 日志归 H10_ORPHAN/
+            h10.finish(None)
         if notifier:
             notifier.emit("done_abort", "无数据文件")
         return None
+
+    h10_info = h10.finish(session) if h10 is not None else None
 
     for fn in sorted(moved):
         size = os.path.getsize(os.path.join(session, fn))
@@ -983,6 +1001,8 @@ def abort_capture(jc, fc, pcap_proc, rec_proc, dropmon, t0, reason,
         f.write(f"verdict_reason=人工中止: {reason}\n")
         f.write("checks_total=0\nchecks_passed=0\nchecks_failed=0\n")
         f.write("checks_unknown=0\n")
+        if h10 is not None:
+            f.write(f"h10={h10_session.summary_word(h10_info)}\n")
         f.write("# 中止的数据不跑判据（L3 逐字节与 RX 通道检测均未执行）。\n")
         f.write("# 要事后补判： verify_pcap_bin.py <本目录> --frame-bytes "
                 f"{fc['frame_bytes']}\n")
@@ -1019,6 +1039,8 @@ def abort_capture(jc, fc, pcap_proc, rec_proc, dropmon, t0, reason,
             f.write(f"serial_errors={len(serial_errs)}\n")
             for e in serial_errs:
                 f.write(f"  {e}\n")
+        if h10 is not None:
+            f.write("\n".join(h10_session.meta_lines(h10_info, t0)) + "\n")
 
     print(f"\n  数据: {session}")
     if not stop_ok:
@@ -1325,6 +1347,35 @@ def capture(idx, jc, fc, use_pcap, run_l3=True, remote=None, notifier=None):
             return False
     cleanup_shm()
 
+    # 心率带 H10：自检都过了才拉起（自检失败的段不产生 H10 文件，免得一堆孤儿日志）。
+    # 放在配 DCA1000 之前：删绑定 + 扫描 + 配对 + 启动 PMD 要 6–7 秒（V2 实测），
+    # 单靠与 [1]–[4] 并行盖不住，所以下面还要 wait_first_pmd()。
+    # 独立进程、自成进程组，见 h10_session.py 文件头。它的任何故障都不进判据。
+    h10 = None
+    if h10_session is not None:
+        h10 = h10_session.H10Session(base, notifier, enabled=H10_ENABLED, max_sec=wait_sec)
+        h10.start()
+    elif H10_ENABLED:
+        print("  [H10] 找不到 h10_session.py，本段不采心率带")
+    try:
+        # V2（10-09）实测：H10 拉起→首个 PMD 6.3–6.8 s，与 sensorStart 几乎同时，余量 ±0.5 s，
+        # 第 3 段雷达开头 0.3 s 没有 H10。这里先等 H10 出数据再配卡，最多 FIRST_PMD_WAIT 秒，
+        # 超时（没戴 / 连不上）照常开采。放在 start_record 之前，不占 30 秒出流窗口。
+        # 在 try 里：等待中 Ctrl-C 也由下面的 finally 回收 H10。
+        if h10 is not None:
+            h10.wait_first_pmd()
+        return _capture_radar(idx, jc, fc, use_pcap, run_l3, remote, notifier, t_setup, h10)
+    finally:
+        # 兜底：正常 / 中止路径已经把 H10 日志移进段目录（finish 可重复调用，直接返回缓存）；
+        # 这里只接住「配 DCA1000 失败直接 return」之类没有段目录的情形，日志归 H10_ORPHAN/
+        if h10 is not None:
+            h10.finish(None)
+
+
+def _capture_radar(idx, jc, fc, use_pcap, run_l3, remote, notifier, t_setup, h10):
+    """capture() 的雷达部分，原样拆出来，只多传一个 h10 句柄给收尾用"""
+    base, prefix = t_setup["base"], t_setup["prefix"]
+
     print("\n[1] 配置 DCA1000")
     if cli("fpga", "FPGA 配置")[0] != 0:
         print("  [WARN] FPGA 配置返回非 0，继续")
@@ -1361,7 +1412,7 @@ def capture(idx, jc, fc, use_pcap, run_l3=True, remote=None, notifier=None):
         dropmon.start()
         try:
             return _run(idx, jc, fc, use_pcap, pcap_proc, rec_proc, dropmon, t_setup,
-                        run_l3, remote, notifier)
+                        run_l3, remote, notifier, h10)
         finally:
             dropmon.stop()
     except (Exception, KeyboardInterrupt) as e:
@@ -1374,12 +1425,12 @@ def capture(idx, jc, fc, use_pcap, run_l3=True, remote=None, notifier=None):
         why = "Ctrl-C" if isinstance(e, KeyboardInterrupt) \
             else f"异常中止: {type(e).__name__}: {e}"
         abort_capture(jc, fc, pcap_proc, rec_proc, dropmon, None, why,
-                      notifier=notifier, use_pcap=use_pcap)
+                      notifier=notifier, use_pcap=use_pcap, h10=h10)
         raise
 
 
 def _run(idx, jc, fc, use_pcap, pcap_proc, rec_proc, dropmon, t_setup,
-         run_l3=True, remote=None, notifier=None):
+         run_l3=True, remote=None, notifier=None, h10=None):
     base, prefix = t_setup["base"], t_setup["prefix"]
     dur, wait_sec = t_setup["dur"], t_setup["wait_sec"]
 
@@ -1397,7 +1448,7 @@ def _run(idx, jc, fc, use_pcap, pcap_proc, rec_proc, dropmon, t_setup,
         # 它会留在 fileBasePath 根目录，把下一次采集的残留检查挡死。
         abort_capture(jc, fc, pcap_proc, rec_proc, dropmon, None,
                       "cfg 发送失败且 sensorStart 未成功",
-                      notifier=notifier, use_pcap=use_pcap, serial_errs=errs)
+                      notifier=notifier, use_pcap=use_pcap, serial_errs=errs, h10=h10)
         return False
     if not ok and started:
         print(f"  [WARN] 有 {len(errs)} 条命令报错，但 sensorStart 已成功 ——")
@@ -1435,7 +1486,7 @@ def _run(idx, jc, fc, use_pcap, pcap_proc, rec_proc, dropmon, t_setup,
         if remote is not None:
             remote.set_state(remote_control.ABORTING)
         abort_capture(jc, fc, pcap_proc, rec_proc, dropmon, t0, aborted,
-                      notifier=notifier, use_pcap=use_pcap, serial_errs=errs)
+                      notifier=notifier, use_pcap=use_pcap, serial_errs=errs, h10=h10)
         return False
     print("\r  等待结束        ")
 
@@ -1447,6 +1498,11 @@ def _run(idx, jc, fc, use_pcap, pcap_proc, rec_proc, dropmon, t_setup,
         notifier.emit("finalizing")
     # 先停 dropmon：stop_record 会关闭 socket，那之后 /proc/net/udp 就读不到了
     dropmon.stop()
+
+    # H10 此刻已覆盖整个雷达窗口 + BUFFER_SEC。只发信号不等，
+    # 它的收尾（停 PMD、断开）与下面 stop_record 的 7 秒并行
+    if h10 is not None:
+        h10.request_stop()
 
     # stop_record 必然报 -4068 超时（7 秒 < CLI_Record 的 90 秒唤醒周期），
     # 这是 TI 的设计缺陷、不是我们的错。数据此时已落盘，照常收尾。
@@ -1484,6 +1540,9 @@ def _run(idx, jc, fc, use_pcap, pcap_proc, rec_proc, dropmon, t_setup,
     for fn in sorted(moved):
         size = os.path.getsize(os.path.join(session, fn))
         print(f"     {fn}  {size:,} B")
+
+    # H10 日志移进同一个段目录（之后若判 BAD 改目录名，它跟着走）
+    h10_info = h10.finish(session) if h10 is not None else None
 
     bins = sorted(glob.glob(os.path.join(session, "*_Raw_*.bin")))
     total = sum(os.path.getsize(b) for b in bins)
@@ -1604,6 +1663,9 @@ def _run(idx, jc, fc, use_pcap, pcap_proc, rec_proc, dropmon, t_setup,
         f.write(f"checks_passed={sum(1 for c in checks if c[1] is True)}\n")
         f.write(f"checks_failed={sum(1 for c in checks if c[1] is False)}\n")
         f.write(f"checks_unknown={sum(1 for c in checks if c[1] is None)}\n")
+        # 心率带只注明、不参与 verdict（用户 09-30 第 3 点）
+        if h10 is not None:
+            f.write(f"h10={h10_session.summary_word(h10_info)}\n")
 
         # 每项判据一行，机器可 grep "^check\." 逐项取值
         f.write("\n# ----- 逐项判据（PASS/FAIL/UNKNOWN + 说明）-----\n")
@@ -1647,6 +1709,8 @@ def _run(idx, jc, fc, use_pcap, pcap_proc, rec_proc, dropmon, t_setup,
             f.write(f"serial_errors={len(errs)}\n")
             for e in errs:
                 f.write(f"  {e}\n")
+        if h10 is not None:
+            f.write("\n".join(h10_session.meta_lines(h10_info, t0, t1)) + "\n")
 
     print(f"\n  数据: {session}")
     print("=" * 62)
@@ -1753,7 +1817,13 @@ def main():
                     help="把遥控状态机的当前状态写到该文件，供 "
                          "remote_daemon.py 判断能否退出。由守护进程传入，"
                          "手动运行时不必给")
+    ap.add_argument("--no-h10", action="store_true",
+                    help="本次不随段采心率带 H10（默认采；也可设 CAPTURE_H10=0）")
     args = ap.parse_args()
+
+    global H10_ENABLED
+    if args.no_h10:
+        H10_ENABLED = False
 
     # 用 --mode 覆盖默认值。原先靠改 JSON_CFG/PROFILE_CFG 两个常量切换波形，
     # 那样改动会被下一次 scp 覆盖（2026-08-02 就这样丢过一次，导致对着
@@ -1799,6 +1869,10 @@ def main():
     print(f"  pcap      : {'否' if args.no_pcap else '是'}")
     print(f"  L3 比对   : {'开' if run_l3 else '关'}（{l3_src}）"
           + (f"，预计约 {est:.0f} 秒" if run_l3 and not args.no_pcap else ""))
+    print(f"  心率带H10 : "
+          + ("关" if not H10_ENABLED else
+             ("开（独立进程，故障不判废雷达段）" if h10_session is not None
+              else "开，但找不到 h10_session.py → 不采")))
     print(f"  牛号/模式 : {COW_ID} / {CAPTURE_MODE}")
     print(f"  遥控      : {'开' if args.remote else '关'}"
           + ("（独占输入设备）" if args.remote and args.grab else "")
