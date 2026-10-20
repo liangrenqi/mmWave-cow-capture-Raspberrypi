@@ -20,7 +20,7 @@
         },
         "captureConfig": {
             "fileBasePath": "/mnt/pssd/Ti_radar_data",
-            "filePrefix": "cow_behavior",
+            "filePrefix": "cow_behavior1843",
             "maxRecFileSize_MB": 1024,
             "sequenceNumberEnable": 1,
             "captureStopMode": "infinite",

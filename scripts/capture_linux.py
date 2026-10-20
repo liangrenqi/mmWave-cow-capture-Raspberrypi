@@ -84,6 +84,11 @@ PCAP_USER = os.environ.get("SUDO_USER") or os.environ.get("USER") or "pi"
 BUFFER_SEC = 10                  # 雷达停止后 DCA1000 封口缓冲
 SENSOR_START_TIMEOUT = 12        # 等 sensorStart 裁决的秒数（失败时会死锁）
 
+# mmwavelink 的字段宽度上限。两者都是 rlUInt16_t/文档明写的范围，
+# 超了不报错、静默回绕（见 check_consistency 的注释）。
+MAX_FRAMES = 65535               # rl_sensor.h:963  "Valid Range 0 to 65535"
+MAX_LOOPS = 255                  # rl_sensor.h:958  "valid range = 1 to 255"
+
 # 现场标注
 COW_ID = "UNKNOWN"
 CAPTURE_MODE = "vitalsigns"
@@ -165,6 +170,9 @@ def check_consistency(jc, fc):
 
     两者不等时 DCA1000 与雷达对采集长度的认知不一致：
     偏小则数据截断，偏大则 CLI 等到超时。
+
+    随后查 mmwavelink 的字段宽度。这两条都是**静默失败**：
+    雷达照常回 Done、采集照常开始，只是长度不是你要的那个值。
     """
     if jc["frames"] != fc["frames"]:
         sys.exit(
@@ -172,6 +180,57 @@ def check_consistency(jc, fc):
             f"  {os.path.basename(JSON_CFG)} framesToCapture = {jc['frames']}\n"
             f"  {os.path.basename(PROFILE_CFG)} frameCfg[4]   = {fc['frames']}\n"
             f"  这两个数必须相等。"
+        )
+    check_field_limits(fc)
+
+
+def check_field_limits(fc):
+    """frameCfg 的帧数与 loops 必须装得进 mmwavelink 的 16 位/8 位字段
+
+    2026-08-06 的实害：cow_vitalsigns.cfg 写 72000 帧（想采 60 分钟），
+    雷达静默回绕成 72000-65536 = **6464 帧**，5.4 分钟就自己停了。
+    全链路无一处报错 —— cfg 逐行 Done、sensorStart 通过、判据没跑
+    （因为脚本还在等 60 分钟的倒计时），等了 11 分钟才发现。
+    bin 847,249,408 B = 131072 × 6464 整，pcap 末包是 96 B 零头
+    （雷达自停的特征；被 kill 末包会是满 1456）。
+
+    帧数 0 在 mmwavelink 里合法（= 无穷帧，收到 Frame Stop 才停），
+    但**本脚本不支持**：收尾段只发 stop_record、不发 sensorStop，
+    雷达会一直跑到下次采集开头那句 sensorStop；且 check.bin_total
+    与 L1 都拿 frames × frame_bytes 当期望值，帧数为 0 时无期望值可比。
+    要用无穷模式得先改这三处，别靠这里放行。
+    """
+    frames, loops = fc["frames"], fc["loops"]
+    period_ms = fc["period_ms"]
+    name = os.path.basename(PROFILE_CFG)
+
+    if frames > MAX_FRAMES:
+        max_min = MAX_FRAMES * period_ms / 60000.0
+        sys.exit(
+            f"[ERROR] 帧数超出 16 位上限，拒绝采集\n"
+            f"  {name} frameCfg[4] = {frames}，上限 {MAX_FRAMES}\n"
+            f"  numFrames 是 rlUInt16_t（rl_sensor.h:963，用户指南也写"
+            f" 0 to 65535）\n"
+            f"  真正下发的会是 {frames % (MAX_FRAMES + 1)} 帧，且不会有任何报错。\n"
+            f"  本波形 @ {period_ms} ms/帧 单段最长 {MAX_FRAMES} 帧"
+            f" = {max_min:.1f} 分钟。\n"
+            f"  要采更久请分段连采（json 的 framesToCapture 同步改）。"
+        )
+
+    if frames == 0:
+        sys.exit(
+            f"[ERROR] 帧数为 0（无穷帧），本脚本不支持，拒绝采集\n"
+            f"  {name} frameCfg[4] = 0\n"
+            f"  收尾只发 stop_record 不发 sensorStop，雷达不会停；\n"
+            f"  且 check.bin_total 与 L1 判据没有期望值可比。\n"
+            f"  详见 check_field_limits 的注释。"
+        )
+
+    if not 1 <= loops <= MAX_LOOPS:
+        sys.exit(
+            f"[ERROR] loops 超出有效范围，拒绝采集\n"
+            f"  {name} frameCfg[3] = {loops}，有效范围 1-{MAX_LOOPS}\n"
+            f"  numLoops 的文档范围见 rl_sensor.h:958。同样是静默失败。"
         )
 
 
