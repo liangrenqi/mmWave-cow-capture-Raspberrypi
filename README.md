@@ -115,6 +115,8 @@ grep -l "^verdict=BAD" /mnt/pssd/Ti_radar_data/*/capture_meta.txt
 
 封盒后的遥控采集（上电自启、POWER 启停程序、ENTER 采一段、ESC 中止）
 见 [docs/OPERATION.md](docs/OPERATION.md#三遥控采集封盒后的主用方式)。
+开机后要先联网校时才能采：Pi 没有 RTC，跨过校时跳变的段 bin 会被截断。
+守护进程会等校时完成再放开 POWER，见 [docs/TIME_SYNC.md](docs/TIME_SYNC.md)。
 
 ## 目录结构
 
@@ -124,7 +126,7 @@ check.sh            环境自检，clone 后先跑这个
 bin/                已编译的 ARM64 二进制（CLI_Control / CLI_Record / libRF_API.so）
 scripts/            采集与验证脚本
 config/             波形 cfg、DCA1000 json、系统配置（sysctl / udev / systemd unit）
-sounds/             语音提示 wav（15 个，文件名即内容）
+sounds/             语音提示 wav（19 个，文件名即内容）
 dca1000_src/        已打补丁的 TI CLI 源码（想自己编译时用）
 patches/            对 TI 原始源码的三处补丁及说明
 docs/               文档
@@ -140,7 +142,7 @@ docs/               文档
 | `capture_linux.py` | 采集主脚本。自检 → 拉起心率带 → 配置 DCA1000 → 抓包 → 下发 cfg → 收尾 → 7 项判据 |
 | `h10_session.py` | 每段一个 H10 进程：拉起、等首个 PMD、停止、日志归档、写 meta。异常全吞，不进判据 |
 | `h10_logger.py` | H10 BLE 记录：只存原始字节 + 双时钟；断线重连、建连前删绑定 |
-| `remote_daemon.py` | 开机自启的守护进程：POWER × 2 启停采集程序 |
+| `remote_daemon.py` | 开机自启的守护进程：记录供电、等 NTP 校时，之后 POWER × 2 启停采集程序 |
 | `remote_control.py` | 采集程序内的遥控状态机与语音后端（ENTER × 2 采一段、ESC 中止） |
 | `probe_radar.py` | 雷达存活探针。0 字节即固件没跑，此时任何 cfg 结果都不可信 |
 | `verify_pcap_bin.py` | L3 逐字节比对（pcap 重排后 ≡ bin），流式、跨分片 |
@@ -157,6 +159,7 @@ docs/               文档
 | [docs/OPERATION.md](docs/OPERATION.md) | 操作手册：开机到取数的完整步骤、语音含义、现场检查清单 |
 | [docs/TECHNICAL.md](docs/TECHNICAL.md) | 技术文档：数据格式、判据体系、参数推导、遥控、心率带、源码依据 |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 异常说明：每种故障的症状、根因、处置 |
+| [docs/TIME_SYNC.md](docs/TIME_SYNC.md) | NTP 校时：开机闸门、服务器配置（两套雷达同用 ntp.aliyun.com）、B 套部署、误差 |
 | [docs/CHANGELOG.md](docs/CHANGELOG.md) | 迄今所有修改及其依据 |
 | [patches/](patches/) | TI CLI 源码的 ARM64 移植补丁（3 处，修 SIGBUS） |
 
@@ -184,8 +187,14 @@ pip install --user bleak==3.0.2
 - 心率带 H10 并入：2026-10-09 V2 重做 / V2-R 断线重连 / V3 冷启动 systemd + 中止，全部通过，
   雷达七项判据不受影响。
 
-剩余：功耗与温度实测、GPIO 状态灯、封盒；
-开机后 SSD 首次挂载掉线（疑供电）与冷启动雷达零回显两个现场问题待处置。
+- 开机校时闸门：2026-10-19 用户现场实测符合预期。
+- SSD 预检与开机供电日志：2026-10-19 离线单测通过，拔 SSD 的硬件测试未做。
+
+剩余：
+- 功耗与温度实测、GPIO 状态灯、封盒
+- 供电：电源只给 900 mA、无 PD，SSD 掉线、整机断电、XDS110 掉线疑同一根因，未坐实
+- 冷启动雷达零回显（约一成，只有断 ICBOOST 的 5V 有效）待处置
+- B 套（IWR1843）：校时按 [docs/TIME_SYNC.md](docs/TIME_SYNC.md) 部署；波形 cfg 与心率带开关未定
 
 ## 许可与来源
 

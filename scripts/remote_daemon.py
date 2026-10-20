@@ -14,7 +14,7 @@
 所以 POWER 管"程序开关"，ENTER/ESC 管"采集开关"。封盒后饲养员只需记
 两件事：POWER 双击开机待命，ENTER 双击采一段。
 
-## 三个必须这样做的理由
+## 四个必须这样做的理由
 
 **1. POWER 键在 event7，与 ENTER/ESC 的 event9 不是同一个节点。**
 实测 Genius 遥控的键分布：
@@ -49,9 +49,28 @@ RemoteController 筛的是"能报 ENTER 且能报 ESC"，event7 匹配不上，
 故按退出时先读子进程写的状态文件，只有 IDLE 才放行，否则播"忙"提示音。
 要中止当前采集请先按 ESC。
 
+**4. 开机先等 NTP 校时，校时完成前 POWER 不响应。**
+Pi 没有 RTC，开机时钟是 fake-hwclock 存的旧值，联网后 timesyncd 首次校时
+会把时钟往前拨（10-19 实测 +29 s ~ +8705 s）。采集段跨过这一刻、且跳变
+超过 80 s 时 bin 被截断、pcap 完整 —— 10-19 三段 BAD 都是这样，截断点与
+校时时刻吻合（实测）。原因是 CLI_Record 的捕获超时用 time(NULL)+80 当
+CLOCK_REALTIME 绝对时刻（osal_linux.cpp:553-580，读源码），时钟一跳就到期。
+所以等 /run/systemd/timesync/synchronized 出现才放行。该文件在 /run（tmpfs）
+里，每次开机清空，不会误用上次开机的状态。**没联网就一直等，不放行**
+（用户 10-19 定）：中途联网照样会跳变。
+
+## 开机记录供电（只写日志，不播语音）
+
+10-19 晚 SSD 整次开机反复掉线、Pi 两次无关机流程断电，当时电源只通告
+900 mA、持续欠压。启动时把电源上限、PD 档位、get_throttled、5V 输入电压
+写进 journal，事后排查不必再靠猜当时用的是什么电源。不播语音：牛场只能用
+移动电源，供电不足是已知条件，每次开机都报只会让人麻木（用户 10-19 定）。
+之后的欠压事件内核会持续记录（journalctl -k 里的 Undervoltage detected）。
+
 用法：
     python3 remote_daemon.py              # 前台跑，调试用
     python3 remote_daemon.py --check      # 只自检环境，不进主循环
+    python3 remote_daemon.py --no-wait-time   # 跳过校时等待（离线调试用）
     systemctl start radar-remote          # 装成服务后
 """
 
@@ -92,6 +111,16 @@ STATE_FILE = os.path.join(HERE, ".remote_state")
 GRACEFUL_WAIT = 45.0
 
 LOGIND_DROPIN = "/etc/systemd/logind.conf.d/99-radar-remote.conf"
+
+# timesyncd 每次校时成功都 touch 这个文件（systemd-timesyncd.service(8)，
+# Pi 上 systemd 252 已核实）。capture_linux.py 里有同名常量，改要一起改
+TIME_SYNC_FLAG = "/run/systemd/timesync/synchronized"
+TIME_POLL_SEC = 1.0        # 查校时标志的周期
+TIME_LOG_SEC = 60.0        # 等待期间每隔多久往日志打一行
+
+# 固件开机时把电源协商结果写在这里（见 log_power_status）
+POWER_DT = "/proc/device-tree/chosen/power"
+FULL_PSU_MA = 5000         # Pi 5 要 5V/5A 才解锁 USB 外设大电流（wireless/README.md:686）
 # ==================================
 
 
@@ -104,6 +133,8 @@ class DaemonNotifier:
     """
 
     _TEXT = {
+        "time_waiting":  "正在等待联网校时 —— 校时完成前 [POWER] 不响应",
+        "time_synced":   "时间校正完毕",
         "daemon_ready":  "守护进程就绪 —— 双击 [POWER] 启动采集程序",
         "app_starting":  "采集程序启动中",
         "app_exiting":   "采集程序退出中",
@@ -113,6 +144,8 @@ class DaemonNotifier:
     }
 
     _AUDIO = {
+        "time_waiting": "time_waiting.wav",
+        "time_synced":  "time_synced.wav",
         "daemon_ready": "daemon_ready.wav",
         "app_starting": "daemon_start.wav",
         "app_exiting":  "daemon_exit.wav",
@@ -193,6 +226,110 @@ def check_logind():
     print("  关机改用 sudo poweroff。封盒设备正需如此。", flush=True)
     print("=" * 66, flush=True)
     return False
+
+
+def time_synced():
+    """本次开机 timesyncd 是否已经校时成功过（见文件头第 4 条）"""
+    return os.path.exists(TIME_SYNC_FLAG)
+
+
+def timesyncd_active():
+    """systemd-timesyncd 是否在运行。它不在的话标志文件永远不会出现，
+    守护进程会一直等 —— 所以要单独查出来、说清楚。查不了返回 None"""
+    try:
+        r = subprocess.run(["systemctl", "is-active", "--quiet",
+                            "systemd-timesyncd"], timeout=5)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _dt_bytes(name):
+    try:
+        with open(os.path.join(POWER_DT, name), "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _dt_u32(name):
+    b = _dt_bytes(name)
+    return int.from_bytes(b[:4], "big") if b and len(b) >= 4 else None
+
+
+def _vcgencmd(*args):
+    try:
+        r = subprocess.run(["vcgencmd", *args], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+# vcgencmd get_throttled 的位定义（Pi 上 man vcgencmd 核实）
+_THROTTLE_BITS = ((0, "当前欠压"), (1, "当前 ARM 限频"), (2, "当前降频"),
+                  (3, "当前温度软限"), (16, "开机以来欠压过"),
+                  (17, "开机以来限频过"), (18, "开机以来降频过"),
+                  (19, "开机以来温度软限过"))
+
+
+def power_status():
+    """读电源能力与欠压状态，返回 (日志行列表, 是否有隐患)
+
+    只读不改，读不到的项写"读不到"，不抛异常。
+    """
+    lines, warn = [], False
+
+    ma = _dt_u32("max_current")
+    pdo = _dt_bytes("usbpd_power_data_objects")
+    usb_en = _dt_u32("usb_max_current_enable")
+    oc = _dt_u32("usb_over_current_detected")
+    if ma is None:
+        lines.append(f"电源上限: 读不到（{POWER_DT}/max_current）")
+    else:
+        pd = "读不到" if pdo is None else ("全 0" if not any(pdo) else "有")
+        lines.append(f"电源上限 max_current={ma} mA，PD 档位(PDO) {pd}，"
+                     f"usb_max_current_enable={usb_en}，"
+                     f"usb_over_current_detected={oc}")
+        if ma < FULL_PSU_MA:
+            warn = True
+            lines.append(f"⚠ 电源不足 {FULL_PSU_MA} mA：USB 外设限流，"
+                         "SSD / XDS110 可能掉线、整机可能掉电")
+    if oc:
+        warn = True
+        lines.append("⚠ 本次开机 USB 口检测到过流")
+
+    thr = _vcgencmd("get_throttled")          # "throttled=0x50005"
+    try:
+        val = int(thr.split("=")[1], 16)
+    except (AttributeError, IndexError, ValueError):
+        val = None
+    if val is None:
+        lines.append(f"欠压状态: 读不到（vcgencmd get_throttled → {thr}）")
+    else:
+        flags = [txt for bit, txt in _THROTTLE_BITS if val >> bit & 1]
+        lines.append(f"get_throttled=0x{val:x}"
+                     + (f"（{'、'.join(flags)}）" if flags else "（无）"))
+        if val & 0x10001:
+            warn = True
+
+    v = _vcgencmd("pmic_read_adc", "EXT5V_V")  # "EXT5V_V volt(24)=4.88162000V"
+    try:
+        lines.append(f"5V 输入 EXT5V_V={float(v.split('=')[1].rstrip('V')):.3f} V")
+    except (AttributeError, IndexError, ValueError):
+        lines.append(f"5V 输入: 读不到（vcgencmd pmic_read_adc EXT5V_V → {v}）")
+
+    return lines, warn
+
+
+def log_power_status():
+    """开机把供电状况写进日志，只记不播（见文件头"开机记录供电"）"""
+    lines, warn = power_status()
+    for s in lines:
+        print(f"  [守护] {s}", flush=True)
+    if warn:
+        print("  [守护] 之后的欠压由内核持续记录："
+              "journalctl -k | grep -i voltage", flush=True)
 
 
 def read_child_state(expect_pid=None):
@@ -429,6 +566,7 @@ class Daemon:
         self.child = None
         self._lock = threading.Lock()
         self._quit = threading.Event()
+        self._time_ok = threading.Event()   # 校时完成前 POWER 一律不响应
 
     # ---------- 子进程管理 ----------
 
@@ -461,6 +599,9 @@ class Daemon:
         # 封盒后无人看管，这种误输入没人能发现。
         if not self.args.no_grab_capture:
             argv.append("--grab")
+        # 守护进程跳过了校时等待，子进程的校时检查也得跟着关，否则每段都被拒
+        if self.args.no_wait_time:
+            argv.append("--no-time-check")
 
         self.notifier.emit("app_starting")
         try:
@@ -522,6 +663,13 @@ class Daemon:
     # ---------- POWER 双击的处理 ----------
 
     def on_power_double(self):
+        # 校时完成前一律不响应（文件头第 4 条）。重播等待提示：按了没声音，
+        # 饲养员会以为遥控器坏了（10-13 残留文件那次就是这样被误判的）
+        if not self._time_ok.is_set():
+            print("  [守护] 尚未完成校时，POWER 不响应", flush=True)
+            self.notifier.emit("time_waiting", "按键已忽略")
+            return
+
         # 串行化：双击回调来自监听线程，start/stop 都不是原子的
         with self._lock:
             if not self.child_running():
@@ -545,6 +693,48 @@ class Daemon:
                 print(f"  [守护] 当前状态 {state}，拒绝退出", flush=True)
                 self.notifier.emit("busy", f"当前 {state}")
 
+    # ---------- 开机校时闸门 ----------
+
+    def _wait_time_sync(self):
+        """等本次开机的首次 NTP 校时，等到才放开 POWER（文件头第 4 条）
+
+        没联网就一直等，不设超时。返回 True = 已校时；False = 等待中收到退出信号。
+        守护进程重启时多半已经校过时，照样播"时间校正完毕"，听感上每次开机都一样。
+        """
+        if self.args.no_wait_time:
+            print("  [守护] --no-wait-time：跳过校时等待。时钟可能还是旧值，"
+                  "采集段跨过校时会被截断", flush=True)
+            self._time_ok.set()
+            return True
+
+        t0 = time.monotonic()
+        if not time_synced():
+            if timesyncd_active() is False:
+                # 服务不在，标志文件永远不会出现 —— 下面会一直等，先把原因说清楚
+                print("  [守护] ⚠ systemd-timesyncd 没在运行，不会校时，"
+                      "守护进程将一直等待", flush=True)
+                print("         修法： sudo systemctl enable --now "
+                      "systemd-timesyncd", flush=True)
+            print(f"  [守护] 当前时钟 {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                  "（未校时，可能是上次关机前的旧值）", flush=True)
+            self.notifier.emit("time_waiting")
+            last_log = t0
+            while not time_synced():
+                if self._quit.wait(TIME_POLL_SEC):
+                    return False
+                # 计时用 monotonic：time.time() 在校时那一刻会跳
+                now = time.monotonic()
+                if now - last_log >= TIME_LOG_SEC:
+                    last_log = now
+                    print(f"  [守护] 仍在等待校时（已等 {now - t0:.0f} 秒）"
+                          " —— 检查网络", flush=True)
+
+        print(f"  [守护] 已校时（本次等待 {time.monotonic() - t0:.0f} 秒），"
+              f"当前时间 {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+        self.notifier.emit("time_synced")
+        self._time_ok.set()
+        return True
+
     # ---------- 主循环 ----------
 
     def run(self):
@@ -554,24 +744,30 @@ class Daemon:
         print(f"  POWER × 2 : 启动 / 退出采集程序", flush=True)
         print(f"  采集程序内 ENTER × 2 = 采一段，ESC = 中止本段", flush=True)
         print(f"  采集进行中按 POWER 会被拒绝（先按 ESC 中止）", flush=True)
+        print(f"  开机先等联网校时，校时完成前 POWER 不响应", flush=True)
         print(f"  子进程    : {CAPTURE_SCRIPT} {' '.join(CAPTURE_ARGS)}",
               flush=True)
         print(f"  状态文件  : {STATE_FILE}", flush=True)
         print("=" * 66, flush=True)
 
         check_logind()
+        log_power_status()
 
-        watcher = PowerWatcher(self.on_power_double,
-                               grab=not self.args.no_grab).start()
-        self.notifier.emit("daemon_ready")
-
-        # 收到 SIGTERM（systemctl stop）时也要优雅收尾
+        # 收到 SIGTERM（systemctl stop）时也要优雅收尾。
+        # 装在等校时之前：没联网时会一直等，这期间 stop 也得能干净退出
         def _term(signum, frame):
             print(f"\n  [守护] 收到信号 {signum}，收尾中", flush=True)
             self._quit.set()
         signal.signal(signal.SIGTERM, _term)
 
+        # 校时前就开始监听并独占 POWER：不独占的话等待期间按键会漏给
+        # logind/桌面。等待期的按键由 on_power_double 里的 _time_ok 挡掉
+        watcher = PowerWatcher(self.on_power_double,
+                               grab=not self.args.no_grab).start()
+
         try:
+            if self._wait_time_sync():
+                self.notifier.emit("daemon_ready")
             while not self._quit.is_set():
                 # 子进程意外退出（崩溃、或它自己 Ctrl-C 退出）要察觉到，
                 # 否则守护进程会以为它还在、按 POWER 变成"拒绝退出"
@@ -614,7 +810,7 @@ class Daemon:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true",
-                    help="只自检环境（设备、logind、音频），不进主循环")
+                    help="只自检环境（设备、logind、音频、校时、供电），不进主循环")
     ap.add_argument("--no-audio", action="store_true",
                     help="不播语音（也会传给子进程）")
     ap.add_argument("--no-grab", action="store_true",
@@ -624,6 +820,10 @@ def main():
                     help="不让子进程独占 ENTER/ESC。默认独占 —— "
                          "不独占时遥控器同时是普通键盘，ENTER 会往活动"
                          "控制台的 shell 里敲回车（实测 tty1 上有 bash）")
+    ap.add_argument("--no-wait-time", action="store_true",
+                    help="不等 NTP 校时就放开 POWER（离线调试用，也会给子进程"
+                         "传 --no-time-check）。默认等 —— 采集段跨过校时、"
+                         "时钟跳变超过 80 s 时 bin 会被截断")
     args = ap.parse_args()
 
     if args.check:
@@ -677,6 +877,26 @@ def main():
             else:
                 print("    ✓ 守护进程用的音频齐全")
             n.close()
+
+        # "尚未校时"不算失败（没联网时自检本就该能跑），timesyncd 不在才算
+        print(f"\n[5] NTP 校时（{TIME_SYNC_FLAG}）")
+        active = timesyncd_active()
+        if active is False:
+            print("    ✗ systemd-timesyncd 没在运行 —— 守护进程会一直等校时")
+            print("      sudo systemctl enable --now systemd-timesyncd")
+            ok = False
+        elif time_synced():
+            print(f"    ✓ 本次开机已校时，当前 {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            print("    - 尚未校时：守护进程启动后会等校时完成才响应 POWER")
+
+        # 只提示不判失败：牛场只能用移动电源，供电不足是已知条件（用户 10-19 定）
+        print("\n[6] 供电")
+        lines, warn = power_status()
+        for s in lines:
+            print(f"    {s}")
+        if not warn:
+            print("    ✓ 无欠压、电源上限够")
 
         print()
         print("=" * 66)

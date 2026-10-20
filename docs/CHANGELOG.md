@@ -6,6 +6,107 @@
 
 ---
 
+## 2026-10-20
+
+### 校时服务器写成配置文件，B 套按它装
+
+牛场 A 套（6843）与 B 套（1843）同时采，两套必须用同一台 NTP 服务器。
+
+- 新增 `config/99-radar-timesync.conf`：只有 `ntp.aliyun.com` 一台，不加备份（用户 10-20 定）。
+  - 装到 `/etc/systemd/timesyncd.conf.d/`。
+  - 第一行 `NTP=` 置空，清掉主文件里别的服务器。
+- A 套不用装：主文件里早已是 `NTP=ntp.aliyun.com`（09-01），journal 里 45 次校时全是 203.107.6.88（实测）。
+- 新增 `docs/TIME_SYNC.md`：写了闸门流程、B 套部署与判据、两套之间的误差、服务器探测表。
+
+**误差上界的更正**：
+- timesyncd 显示的 Root distance = RootDelay/2 + RootDispersion（实测 15.899/2 + 10.040 = 17.989 ms），**不含 Pi 到服务器这段链路**。
+- 此前说"两台误差上界 ≤ 两台 Root distance 之和"不对。单台约 Root distance + Delay/2 ≈ 57 ms（最坏情况），实测 offset 在 ±10 ms 量级。
+
+`sounds/ssd_missing.wav` 换成用户录音。
+
+### 已知未定（B 套）
+
+- 1843 的波形 cfg 不在 main。08-03 在 A 套 Pi 上的试验克隆（77 GHz、loops 128）存档到分支 `archive/iwr1843-trial-20260803`，**未验证**。
+- B 套不接心率带，unit 要加 `Environment=CAPTURE_H10=0`，否则会去连 A 套那条 H10（待确认）。
+
+---
+
+## 2026-10-19
+
+### ★ 开机先等 NTP 校时（用户实测符合预期）
+
+**现象**：10-19 三段 BAD，都是 bin 截断、pcap 完整，截断点与开机首次校时的时刻吻合（实测）。
+
+**根因（读源码）**：
+- Pi 没有 RTC，开机时钟是旧值，首次校时会往前跳。实测跳了 +29 s 到 +8705 s，10-20 这次开机约 +91 s（按 journal 推算）。
+- CLI_Record 的捕获超时是 `time()+80` 这个 CLOCK_REALTIME 绝对时刻：
+  - 超时常量在 `rf_api_internal.h:132`，用在 `rf_api.cpp:1789`；
+  - 计时在 `osal_linux.cpp:553-580`；
+  - 条件变量用默认属性初始化（`:592`）。
+- 跳变超过 80 s，超时立刻到期。
+
+**改动**：
+- `remote_daemon.py`：
+  - 开机等 `/run/systemd/timesync/synchronized` 出现才播"守护进程已启动"、放开 POWER；
+  - **没联网就一直等，不设超时**（用户 10-19 定）；
+  - 等待期间 POWER 键已独占，按了重播"正在等待联网校时"；
+  - 计时用 monotonic；
+  - SIGTERM 处理装在等待之前，没联网时 `systemctl stop` 也能干净退出。
+- `capture_linux.py` 每段开采前再查一次（拦不经守护进程直接跑的情形），没校时拒采，遥控模式下播"出错"。
+- 两个开关（离线调试用，都打警告）：
+  - `remote_daemon.py --no-wait-time`，会顺带给子进程传 `--no-time-check`；
+  - `capture_linux.py --no-time-check`。
+- `remote_daemon.py --check` 新增 [5] 校时：timesyncd 不在才判失败，"尚未校时"只提示。
+- 语音新增 `time_waiting` / `time_synced`。
+
+### ★ 落盘硬盘预检：盘不在时 10 秒内报，不再卡 3 分钟
+
+**现象**：
+- 10-19 晚 SSD 整次开机没起来（dmesg 272 次 USB disconnect）。
+- `os.makedirs` 碰 `/mnt/pssd` 触发 automount，systemd 等设备 90 秒才报 `Errno 19`，两次共卡 3 分钟才播"出错"。
+- 期间 ESC 打断不了：主线程卡在内核调用里。
+
+**改动**：
+- `capture_linux.py` 新增 `check_storage()`：在碰落盘目录之前，按 fstab 里的 UUID 查 `/dev/disk/by-uuid/` 下的节点。
+  - 这一步不经过 automount，立即有结果。
+  - 节点不在时最多等 10 秒（`STORAGE_WAIT_SEC`），因为 SSD 掉线后重新枚举实测只要 0.6 s。
+- `makedirs` 报 `ENODEV`（节点查过还在、挂载那一刻又掉线，即 10-09 条目记的那次）不再往上抛，改为报错回待命。
+- 两种情况都播新语音 `ssd_missing`："找不到移动硬盘，本次未采集"。
+
+### 开机把供电状况写进日志（只记不播）
+
+10-19 晚 Pi 两次无关机流程断电，当时电源只通告 900 mA。
+
+**改动**：
+- `remote_daemon.py` 启动时把以下几项写进 journal，排查时不必再猜当时用的是什么电源：
+  - `max_current`、PD 档位、`usb_max_current_enable`、`usb_over_current_detected`；
+  - `get_throttled`；
+  - 5V 输入电压。
+- **不播语音**：牛场只能用移动电源，供电不足是已知条件（用户 10-19 定）。
+- `--check` 新增 [6] 供电，只提示不判失败。
+
+10-20 开机的日志（实测）：`max_current=900 mA`、PDO 全 0、`get_throttled=0x50005`（当前欠压）、`EXT5V_V=4.600 V`。
+
+---
+
+## 2026-10-13
+
+### 残留文件拦截改为出声，中止归档后先落盘再报
+
+**现象**：
+- 10-11 起按 ENTER 只听到"采集命令下发"→"可以采集"，不出数据，被当成雷达故障查了两天。
+- 实际是落盘根目录有两个 0 B 残留，被残留检查拦下，而这条拦截在遥控模式下**没有语音**。
+- 日志里写着"已归档"，盘上 `ABORT_` 目录却不存在（实测）。判断是归档还在页缓存里就断了电：exFAT 无日志，饲养员听到"已中止"就拔电。
+
+**改动**：
+- 残留检查拦下时播新语音 `leftover`："数据目录有上次残留文件，本次未采集"。
+- `abort_capture()` 的两条路径（无数据文件、归档）在播 `done_abort` 之前都先 `os.sync()`。
+
+10-13 到 10-19 共加四个语音（`leftover` / `ssd_missing` / `time_waiting` / `time_synced`），
+`sounds/` 现共 19 个 wav（采集 9 + 守护 6 + 心率带 4），`_test_audio.py --gen` 有对应占位音。
+
+---
+
 ## 2026-10-09
 
 ### 并入 Polar H10 心率带（已实测通过，commit bd6bd34）
@@ -585,8 +686,11 @@ TI 只在 Ubuntu 16.04 **x86_64** 上测过，这两个问题在 ARM64 上必然
   封盒后这是唯一能看见状态的途径（DCA1000 面板灯也被盒子挡住）
 - 封盒与防水
 - 考虑把 SSD 格成 ext4（有日志，掉电更安全，且不再需要 `-Z`）
-- **SSD 首次挂载掉线**的处置（供电排查 / 开机即挂载 / 去掉 automount 的 idle-timeout），方案待定
-- **冷启动后雷达串口零回显**的根因（上电时序）
+- **供电**：电源只通告 900 mA、持续欠压。SSD 掉线、XDS110 发射期掉线、整机断电，疑同一根因，未验证。
+  预检只让"盘不在"能及时报出来，没有解决掉线本身。
+- **冷启动后雷达串口零回显**：10-14 坐实在 ICBOOST 侧（只断 ICBOOST 有效），根因未查
+- B 套（1843）：波形 cfg 未定、`CAPTURE_H10=0` 待确认、敲击对时未在实验室并排验证
+- `capture_meta.txt` 不记校时状态
 - 心率带：等首个 PMD 最长实测 8.6 s，离 10 s 上限只差 1.4 s，牛场若常超时需再议
 - 心率带：未标定 BLE 批量延迟与 pcap 首包相对真实 chirp 的延迟（需敲击对时）
 - 心率带："WiFi 开着但没连上任何网络"工况下的 BLE 未测

@@ -230,6 +230,27 @@ python3 scripts/probe_radar.py
 
 封盒后饲养员不碰电脑，全程遥控器 + 语音。**装之前先跑通阶段 1-6。**
 
+### 7.0 NTP 校时（两套雷达用同一台服务器）
+
+守护进程开机先等 timesyncd 校时，校时前 POWER 不响应。所以校时服务必须是 timesyncd，
+服务器必须是 ntp.aliyun.com（A / B 两套一致）。
+
+```bash
+systemctl is-active systemd-timesyncd       # active；chrony / ntp 不要装
+sudo mkdir -p /etc/systemd/timesyncd.conf.d
+sudo cp config/99-radar-timesync.conf /etc/systemd/timesyncd.conf.d/
+sudo systemctl restart systemd-timesyncd
+```
+
+**判据**（联网后）：
+
+```bash
+timedatectl show-timesync -p SystemNTPServers   # 只有 ntp.aliyun.com
+ls /run/systemd/timesync/synchronized           # 存在
+```
+
+为什么必须先校时、B 套的完整步骤、两套之间的误差，见 [TIME_SYNC.md](TIME_SYNC.md)。
+
 ### 7.1 ⚠ 先屏蔽 POWER 键的关机功能（这一步不能跳）
 
 `HandlePowerKey` 的 systemd 默认值是 **`poweroff`**，而系统自带 udev 规则
@@ -287,7 +308,7 @@ python3 scripts/_test_remote_keys.py        # 验证双击、去抖、长按忽�
 
 ```bash
 cat /proc/asound/cards        # 方括号里的名字才是 CARD= 要填的
-python3 scripts/_test_audio.py --gen        # 生成缺失的占位音（共 15 个，纯合成；已有的不覆盖）
+python3 scripts/_test_audio.py --gen        # 生成缺失的占位音（共 19 个，纯合成；已有的不覆盖）
 python3 scripts/_test_audio.py              # 按实际顺序播一遍，验证喇叭
 ```
 
@@ -331,7 +352,7 @@ unit 必须显式写 `SupplementaryGroups=input audio dialout …`，
 
 重启后**不敲任何命令**：
 
-- [ ] 听到"守护进程已启动"（`daemon_ready.wav`）← 自启成功
+- [ ] 联网后依次听到"时间校正完毕"、"守护进程已启动"（`daemon_ready.wav`）← 校时完成 + 自启成功
 - [ ] `POWER` × 2 → "采集程序启动" → `ENTER` × 2 → "采集命令下发" →
       "心率带已连接" →（15–30 秒）→ "采集开始" → 采完 → "通过"
 - [ ] 采集中按 `ENTER` 被锁定（防误触）、按 `POWER` 被拒绝（播"忙"）
@@ -340,7 +361,7 @@ unit 必须显式写 `SupplementaryGroups=input audio dialout …`，
 
 ```bash
 systemctl is-active radar-remote        # active
-python3 scripts/remote_daemon.py --check   # 设备 + logind + 音频一次查完
+python3 scripts/remote_daemon.py --check   # 设备 + logind + 音频 + 校时 + 供电一次查完
 ```
 
 最后那项判据最关键：原 Ctrl-C 路径不归档，游离文件会留在落盘根目录
@@ -401,5 +422,7 @@ Pi 上跑这个走真信号 + GNU `timeout`，全部应通过（Windows 上信�
 | H10 扫不到 | 没佩戴或电极干；按名字找（广播可以不带名字），应按 MAC |
 | H10 建连反复失败（0x3e） | WiFi 在 2.4 GHz |
 | `h10_status=START_FAILED` | bleak 没装，或服务不是 `User=pi` 看不见用户级包 |
+| 开机 POWER 没反应，一直播"正在等待联网校时" | 没联网或阿里云不通，见 7.0 |
+| "找不到移动硬盘，本次未采集" | SSD 没插好，或供电不足在掉线（未坐实） |
 
 更多见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。

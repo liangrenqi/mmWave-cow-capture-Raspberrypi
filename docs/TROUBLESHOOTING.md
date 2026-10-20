@@ -176,25 +176,45 @@ bin 完整落盘。那次判 BAD 是 pcap 拖累的。
 
 ---
 
-### 开机后第一段报"采集失败"：OSError Errno 19 No such device
+### "找不到移动硬盘，本次未采集"（SSD 不在 / 挂载时掉线）
 
-**症状**：开机后第一次 `ENTER` × 2 直接播"采集失败"然后回到"可以采集"；
-终端或 journal 里是 `os.makedirs` 处的 `OSError: [Errno 19] No such device`。
-再按一次就正常。
+**症状**：`ENTER` × 2 后播"采集命令下发"→"找不到移动硬盘，本次未采集"→"可以采集"。
+journal 里是下面两种之一：
 
-**经过**（2026-10-09 实测，journal + dmesg 对得上）：采集程序第一次访问 `/mnt/pssd`
-触发 systemd automount，同一秒移动 SSD 在 USB 3 总线上掉线（`usb 2-1: USB disconnect`），
-mount 读不到 superblock；0.6 s 后 SSD 重新枚举成功。
+```
+[ERROR] 找不到落盘硬盘 /dev/disk/by-uuid/BC5D-5F6E（fstab 里 /mnt/pssd 的设备），等了 10 秒没出现
+[ERROR] 挂载落盘硬盘失败: /mnt/pssd/Ti_radar_data ([Errno 19] No such device)
+```
 
-**嫌疑是供电，未坐实**：`vcgencmd get_throttled` = `0x50000`（开机以来欠压过 + 降频过），
-每段开始都报欠压，`usb_max_current_enable=0`，USB 上挂着 SSD + XDS110 + 遥控接收器 + 喇叭；
-但掉线那一秒内核**没有**报欠压。
+**两种情形**：
 
-**影响**：程序处理是对的 —— 报错、回到待命、未拉起心率带、无残留。
-但封盒后饲养员只会听到"采集失败"。另外 automount 的 `idle-timeout=600`
-意味着空闲 10 分钟会卸载，下一段又要首次挂载。
+1. **盘整个不在**（2026-10-19 晚实测）：SSD 整次开机没起来，dmesg 里 272 次 `USB disconnect`。
+   - 旧版直接 `os.makedirs` 去碰 `/mnt/pssd`，触发 automount（fstab 里是 `x-systemd.automount,nofail`），
+     systemd 等设备 90 秒才报 `Errno 19`，两次共卡 3 分钟，期间 ESC 也打断不了。
+   - 现在先查 `/dev/disk/by-uuid/` 下的节点，这一步不经过 automount，最多等 10 秒就报。
+2. **挂载那一刻掉线**（2026-10-09 实测，journal + dmesg 对得上）：节点查过还在，
+   首次访问触发挂载，同一秒 SSD 在 USB 3 上掉线、读不到 superblock，0.6 s 后又枚举回来。
+   - 旧版播"出错"，现在播同一句"找不到移动硬盘"。
+   - automount 的 `idle-timeout=600` 意味着空闲 10 分钟会卸载，下一段又要首次挂载。
 
-**现场处置**：再按一次 `ENTER` × 2。根本处置（供电、挂载方式）待定。
+**嫌疑是供电，未坐实**：
+- 10-20 开机日志：`max_current=900 mA`、PD 档位全 0、`get_throttled=0x50005`（当前欠压）、`EXT5V_V=4.600 V`
+- USB 上挂着 SSD + XDS110 + 遥控接收器 + 喇叭
+- 但 10-09 掉线那一秒内核**没有**报欠压
+
+**影响**：报错、回到待命、未拉起心率带、无残留，雷达没被碰。
+
+**现场处置**：
+- 偶发一次：再按一次 `ENTER` × 2
+- 反复出现：重插 SSD、换电源
+
+**排查**：
+
+```bash
+ls /dev/disk/by-uuid/                              # 应有 BC5D-5F6E
+dmesg | grep -c "USB disconnect"                   # 掉线次数
+journalctl -u radar-remote -b | grep -E "电源上限|get_throttled|EXT5V"   # 本次开机的供电
+```
 
 ---
 
@@ -240,6 +260,24 @@ pkill -9 -f DCA1000EVM_CLI_Record
 ipcs -m | grep 0xffffffff        # 找 key 为 0xffffffff、nattch=0 的段
 ipcrm -m <shmid>
 ```
+
+---
+
+### bin 在中途截断、pcap 完整（开机校时跳变）
+
+**症状**：`check.bin_total=FAIL`，bin 比期望短，但 pcap 序号连续、L2 相符。
+截断时刻与 journal 里 `systemd-timesyncd` 的 `Initial clock synchronization` 吻合。
+
+**根因**（2026-10-19 三段实测，机理读源码）：
+- Pi 没有 RTC，开机时钟是旧值，首次校时往前跳（实测 +29 s 到 +8705 s）。
+- CLI_Record 的捕获超时是 `time()+80` 这个 CLOCK_REALTIME 绝对时刻
+  （`osal_linux.cpp:553-580`、`rf_api_internal.h:132`），跳变超过 80 s 就立刻到期。
+
+**处置**：
+- 现在守护进程开机先等校时，采集脚本每段再查一次，正常流程下不会再发生。
+- 还出现的话，查这一段是不是用了 `--no-time-check` / `--no-wait-time`。
+- pcap 完整，可以用 `pcap_to_bin.py` 重建 bin。
+- 详见 [TIME_SYNC.md](TIME_SYNC.md)。
 
 ---
 
@@ -323,9 +361,52 @@ pcap 载荷比 bin 多 **128 B** 属正常（末包对齐零头，CLI_Record 不
 
 ## 五、遥控与语音
 
+### 开机一直播"正在等待联网校时"，按 POWER 没反应
+
+**这是设计如此**：校时完成前守护进程不放开 POWER，不设超时（用户 10-19 定）。
+按了只重播这句，不是遥控器坏了。
+
+**根因**：没联网，或联网了但 ntp.aliyun.com 不通（只配了这一台，不会换别的服务器）。
+
+```bash
+timedatectl timesync-status                     # 联系上服务器没有
+journalctl -u systemd-timesyncd -b --no-pager   # 有没有 "Contacted time server"
+journalctl -u radar-remote -b | grep 校时        # 每 60 秒一行"仍在等待校时"
+```
+
+**处置**：开手机热点、确认有流量。timesyncd 没在跑时守护进程启动就会报
+`systemd-timesyncd 没在运行`，`sudo systemctl enable --now systemd-timesyncd`。
+确实只能离线时，见 [TIME_SYNC.md](TIME_SYNC.md) 的 `--no-wait-time`（采集段跨过校时会被截断）。
+
+---
+
+### "数据目录有上次残留文件，本次未采集"
+
+**症状**：`ENTER` × 2 后播"采集命令下发"→ 这句 →"可以采集"，不出数据，怎么重上电都一样。
+journal 里是 `[ERROR] /mnt/pssd/Ti_radar_data 下有 N 个 cow_vitalsigns* 残留文件`。
+
+**经过**（2026-10-11 ~ 10-13 实测）：
+- 一段 ABORT 后日志写"已归档"，盘上 `ABORT_` 目录却不存在，0 B 的 pcap / csv 回到了根目录。
+- 判断是归档还在页缓存里就断了电：exFAT 无日志，饲养员听到"已中止"就拔电。这一条是推断，未验证。
+- 之后每次采集都被残留检查拦下，雷达根本没被碰。
+- 旧版这一步没有语音，现场只听到"就绪"，被当成雷达故障查了两天。
+
+**现在的代码**：中止归档后先 `os.sync()` 再播"已中止"。拦下时播这句。
+
+**处置**：回实验室看根目录那几个文件。0 B 的直接删；有数据的移进一个 `ABORT_` 目录再删根目录的。
+**残留检查不能关**，否则两次的数据会混在一个目录里。
+
+```bash
+ls -la /mnt/pssd/Ti_radar_data/ | grep -v "^d"     # 根目录不应有任何文件
+```
+
+---
+
 ### 按遥控器没有任何反应
 
 按可能性排序：
+
+**0. 开机还没校时。** 守护进程在等校时，按了只重播"正在等待联网校时"，见上一条。
 
 **1. 守护进程没跑。**
 
@@ -626,6 +707,26 @@ python3 scripts/_test_h10_session.py
 # 欠压/降频历史（0x50000 = 开机以来欠压过 + 降频过）
 vcgencmd get_throttled
 journalctl -k -b | grep -iE "under-voltage|usb 2-1|exfat"
+
+# 本次开机的电源能力（守护进程启动时写的）
+journalctl -u radar-remote -b | grep -E "电源上限|get_throttled|EXT5V"
+
+# 落盘硬盘节点在不在（不触发 automount）
+ls /dev/disk/by-uuid/
+
+# 根目录残留（应为空）
+ls -la /mnt/pssd/Ti_radar_data/ | grep -v "^d"
+
+# ---- 校时 ----
+
+# 本次开机校过时没有（守护进程等的就是这个文件）
+ls /run/systemd/timesync/synchronized
+timedatectl timesync-status                    # Server 应为 203.107.6.88 (ntp.aliyun.com)
+timedatectl show-timesync -p SystemNTPServers  # 应只有 ntp.aliyun.com
+journalctl -u systemd-timesyncd -b --no-pager  # 首次校时时刻与跳变
+
+# 守护进程 + 校时 + 供电一次查完
+python3 scripts/remote_daemon.py --check
 ```
 
 ---
@@ -646,7 +747,9 @@ journalctl -k -b | grep -iE "under-voltage|usb 2-1|exfat"
 | meta 里 `disconnected_at_end` | 结束时 Pi 主动断开，不算断线；意外断开才记 `disconnected` |
 | `bond_remove rc` 非 0 | 设备本来就没绑定时 `bluetoothctl remove` 也报错，正常 |
 | 心率带断了但雷达段判"通过" | 设计如此，心率带不参与判定 |
-| 开机后第一段"采集失败"，再按就好 | SSD 首次挂载掉线（疑供电），见第二节 |
+| "找不到移动硬盘"，再按就好 | SSD 挂载那一刻掉线（疑供电），见第二节；反复出现才是盘不在 |
+| 开机后 POWER 一直没反应，只播"正在等待联网校时" | 设计如此，校时前不放行，开热点即可 |
+| 开机日志"⚠ 电源不足 5000 mA" | 移动电源本来就达不到，只记不播（用户 10-19 定） |
 | 采集中按 POWER 退不出 | 设计如此，防止雷达不停 + 游离文件卡死下次采集 |
 | 采集中按 ENTER 无反应 | 开始键已锁定，防误触 |
 | 按住按键不放没反复触发 | `value==2`（长按重复）被有意忽略 |

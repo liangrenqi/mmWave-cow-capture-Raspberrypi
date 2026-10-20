@@ -20,6 +20,7 @@ IWR6843 + DCA1000 采集脚本（Linux / 树莓派 5）
 """
 
 import argparse
+import errno
 import glob
 import json
 import os
@@ -104,6 +105,15 @@ ABORT_SETTLE_SEC = 3             # 中止时给 DCA1000 吐完在途数据的时
 # 超了不报错、静默回绕（见 check_consistency 的注释）。
 MAX_FRAMES = 65535               # rl_sensor.h:963  "Valid Range 0 to 65535"
 MAX_LOOPS = 255                  # rl_sensor.h:958  "valid range = 1 to 255"
+
+# 开采前要求本次开机已 NTP 校时（见 check_time_sync）。
+# remote_daemon.py 里有同名常量，改要一起改
+TIME_SYNC_FLAG = "/run/systemd/timesync/synchronized"
+TIME_CHECK = True                # --no-time-check 关掉
+
+# 落盘硬盘在不在：碰 fileBasePath 之前先查 fstab 对应的设备节点（见 check_storage）
+FSTAB = "/etc/fstab"
+STORAGE_WAIT_SEC = 10            # 节点不在时最多等多久（SSD 可能正在重新枚举）
 
 # 心率带 H10 随段采集（独立进程，见 h10_session.py）。
 # 关掉：--no-h10，或环境变量 CAPTURE_H10=0（整轮都不要时设一次即可）
@@ -408,6 +418,100 @@ def _read_sysctl(key):
             return int(f.read().strip())
     except (OSError, ValueError):
         return None
+
+
+def check_time_sync():
+    """本次开机没校过时就拒绝开采，返回 True 表示可以采
+
+    Pi 没有 RTC，开机时钟是 fake-hwclock 存的旧值，联网后 timesyncd 首次校时
+    把时钟往前拨。采集段跨过这一刻、跳变又超过 80 s，CLI_Record 的捕获超时
+    立刻到期，bin 截断而 pcap 完整（10-19 三段 BAD，截断点与校时时刻吻合）。
+    原因是它用 time(NULL)+80 当 CLOCK_REALTIME 绝对时刻
+    （dca1000_src osal_linux.cpp:553-580、rf_api_internal.h:132，读源码）。
+    本脚本的 sensorStart 超时等也用 time.time()，同样会被跳变带偏。
+
+    守护进程已在开机时等过校时，这里拦的是不经守护进程直接跑的情形。
+    标志文件在 /run（tmpfs），每次开机清空，不会误用上次开机的状态。
+    """
+    if not TIME_CHECK:
+        print("  [WARN] --no-time-check：跳过校时检查，采集段跨过校时会被截断")
+        return True
+    if os.path.exists(TIME_SYNC_FLAG):
+        print(f"  -> 已 NTP 校时，当前 {datetime.now():%Y-%m-%d %H:%M:%S} [OK]")
+        return True
+    print(f"  [ERROR] 本次开机尚未 NTP 校时（没有 {TIME_SYNC_FLAG}）")
+    print("       Pi 没有 RTC，联网校时会让时钟往前跳，跨过这一刻的段 bin 会被截断")
+    print("       先联网等校时（timedatectl 里 System clock synchronized: yes），")
+    print("       确实离线时加 --no-time-check")
+    return False
+
+
+_DEV_BY = {"UUID": "/dev/disk/by-uuid/", "PARTUUID": "/dev/disk/by-partuuid/",
+           "LABEL": "/dev/disk/by-label/", "PARTLABEL": "/dev/disk/by-partlabel/"}
+
+
+def _fstab_entry_for(path):
+    """fstab 里管 path 的那一条（挂载点是 path 本身或其上级，取最长的）
+
+    返回 (设备, 挂载点)，没有返回 None。只做字符串比较，不 stat path ——
+    stat 一下 automount 目录就会触发挂载，正是要避开的。
+    """
+    path = os.path.normpath(path)
+    best = None
+    try:
+        with open(FSTAB) as f:
+            for line in f:
+                fields = line.split()
+                if len(fields) < 2 or fields[0].startswith("#"):
+                    continue
+                mnt = os.path.normpath(fields[1].replace("\\040", " "))
+                if path == mnt or path.startswith(mnt.rstrip("/") + "/"):
+                    if best is None or len(mnt) > len(best[1]):
+                        best = (fields[0], mnt)
+    except OSError:
+        return None
+    return best
+
+
+def check_storage(base):
+    """落盘目录所在的硬盘在不在 —— 必须在碰 base 之前查，返回 True 表示可以采
+
+    /mnt/pssd 是 x-systemd.automount + nofail：盘不在时，对它的任何访问
+    （makedirs、isdir、stat）都会让 systemd 等设备，默认 90 秒才报 Errno 19。
+    10-19 晚 SSD 因供电整次开机没起来，makedirs 里触发两次，卡了 3 分钟才播
+    "出错"，期间 ESC 也打断不了（主线程卡在内核调用里），现场像是命令没执行。
+
+    查 /dev/disk/by-uuid/ 下的节点不经过 automount，立即有结果。节点不在时
+    再等 STORAGE_WAIT_SEC 秒：SSD 掉线后重新枚举通常不到 1 秒（10-08 实测 0.6 s）。
+    不归 fstab 管的目录（如本地调试目录）不查，交给 preflight。
+    """
+    ent = _fstab_entry_for(base)
+    if ent is None or ent[1] == "/":
+        return True
+    spec, mnt = ent
+    if spec.startswith("/dev/"):
+        node = spec
+    else:
+        key, sep, val = spec.partition("=")
+        if not (sep and key in _DEV_BY):
+            return True             # tmpfs、网络盘之类，没有设备节点可查
+        node = _DEV_BY[key] + val.strip('"')
+
+    t0 = time.monotonic()
+    while not os.path.exists(node):
+        if time.monotonic() - t0 >= STORAGE_WAIT_SEC:
+            print(f"  [ERROR] 找不到落盘硬盘 {node}（fstab 里 {mnt} 的设备），"
+                  f"等了 {STORAGE_WAIT_SEC} 秒没出现")
+            print("       移动硬盘没插好，或供电不足在反复掉线："
+                  "dmesg | grep -c 'USB disconnect'")
+            print(f"       没先查就碰 {mnt} 的话，automount 会等设备 90 秒，"
+                  "期间 ESC 也打断不了")
+            return False
+        time.sleep(0.5)
+    waited = time.monotonic() - t0
+    print(f"  -> 落盘硬盘 {node} 在"
+          + (f"（等了 {waited:.1f} 秒）" if waited >= 0.5 else "") + " [OK]")
+    return True
 
 
 def preflight(rate_bps, base_path=None, need_bytes=None):
@@ -973,6 +1077,7 @@ def abort_capture(jc, fc, pcap_proc, rec_proc, dropmon, t0, reason,
         print("  -> 没有产生任何数据文件（中止得早），无需归档")
         if h10 is not None:             # 没有雷达目录可放，H10 日志归 H10_ORPHAN/
             h10.finish(None)
+        os.sync()                       # 同下：H10_ORPHAN 日志也要落盘再报
         if notifier:
             notifier.emit("done_abort", "无数据文件")
         return None
@@ -1046,6 +1151,10 @@ def abort_capture(jc, fc, pcap_proc, rec_proc, dropmon, t0, reason,
     if not stop_ok:
         print("  ⚠ sensorStop 未确认成功 —— 下次采集前确认雷达已停"
               "（或拔 5V 重上电）")
+    # 先落盘再播"已中止"：exFAT 无日志，mkdir/move 只在页缓存里时断电会
+    # 整体丢失（10-11 实例：日志写已归档，目录却不存在、0 B 文件回到根目录，
+    # 之后每次采集都被残留检查拦下）。饲养员听到"已中止"就会拔电。
+    os.sync()
     if notifier:
         notifier.emit("done_abort",
                       f"{got_frames}/{planned} 帧")
@@ -1315,7 +1424,31 @@ def capture(idx, jc, fc, use_pcap, run_l3=True, remote=None, notifier=None):
     print(f"  采集 #{idx}   {fc['frames']} 帧 @ {fc['period_ms']} ms = {dur} 秒")
     print("=" * 62)
 
-    os.makedirs(base, exist_ok=True)
+    # 必须在 makedirs 之前：盘不在时 makedirs 会卡 3 分钟（见 check_storage）
+    if not check_storage(base):
+        if notifier:
+            notifier.emit("ssd_missing", f"等 {STORAGE_WAIT_SEC} 秒未出现")
+        return False
+
+    try:
+        os.makedirs(base, exist_ok=True)
+    except OSError as e:
+        # 节点查过还在、挂载那一刻又掉线（10-08 实例：同一秒 USB disconnect）。
+        # 其它错误照旧抛给上层
+        if e.errno != errno.ENODEV:
+            raise
+        print(f"  [ERROR] 挂载落盘硬盘失败: {base} ({e})")
+        print("       硬盘在挂载那一刻掉线，多半是供电不足；再按一次通常就好")
+        if notifier:
+            notifier.emit("ssd_missing", "挂载时掉线")
+        return False
+
+    # 放在 preflight 之前单独判：遥控模式下要出声（复用 error 音），
+    # 否则现场只听到"准备中→就绪"，像是命令没执行
+    if not check_time_sync():
+        if notifier:
+            notifier.emit("error", "本次开机尚未校时，未采集")
+        return False
 
     # 内核缓冲自检 + 自动修正。放在这里而不是靠人工跑 prepare.sh：
     # sysctl -w 不持久，重启即失，忘记跑不报错、只静默降级成丢包。
@@ -1335,6 +1468,10 @@ def capture(idx, jc, fc, use_pcap, run_l3=True, remote=None, notifier=None):
         for p in leftover[:5]:
             print(f"     {os.path.basename(p)}")
         print("  先处理掉再采，避免两次数据混在一个目录。")
+        # 遥控模式下这里原本无声，现场只听到"准备中→就绪"，像是命令没执行
+        # （10-13 实例：两个 0 B 残留拦了两天，被当成雷达故障）
+        if notifier:
+            notifier.emit("leftover", f"{len(leftover)} 个")
         return False
 
     # 上次的 CLI_Record 必然残留（stop_record 的 7 秒超时 < 接收线程 90 秒
@@ -1819,11 +1956,16 @@ def main():
                          "手动运行时不必给")
     ap.add_argument("--no-h10", action="store_true",
                     help="本次不随段采心率带 H10（默认采；也可设 CAPTURE_H10=0）")
+    ap.add_argument("--no-time-check", action="store_true",
+                    help="不检查本次开机是否已 NTP 校时（离线调试用）。默认检查 —— "
+                         "采集段跨过校时、时钟跳变超过 80 s 时 bin 会被截断")
     args = ap.parse_args()
 
-    global H10_ENABLED
+    global H10_ENABLED, TIME_CHECK
     if args.no_h10:
         H10_ENABLED = False
+    if args.no_time_check:
+        TIME_CHECK = False
 
     # 用 --mode 覆盖默认值。原先靠改 JSON_CFG/PROFILE_CFG 两个常量切换波形，
     # 那样改动会被下一次 scp 覆盖（2026-08-02 就这样丢过一次，导致对着

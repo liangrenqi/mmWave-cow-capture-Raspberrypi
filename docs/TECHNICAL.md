@@ -608,6 +608,34 @@ unit 必须显式 `SupplementaryGroups=input audio dialout …`，
 遥控改动**没碰计时机制**，只把 `time.sleep(1)` 换成 `Event.wait(1)`
 （计时等价，只是可被 `ESC` 打断）。
 
+### 开机校时闸门（2026-10-19）
+
+Pi 没有 RTC，首次 NTP 校时会把时钟往前拨。CLI_Record 的捕获超时是 `time()+80` 这个
+CLOCK_REALTIME 绝对时刻（`osal_linux.cpp:553-580`、`rf_api_internal.h:132`），
+跳变超过 80 s 时跨过这一刻的段 bin 被截断（10-19 三段实测），pcap 完整。
+
+处置是两道闸，都看 timesyncd 每次校时成功都会 touch 的 `/run/systemd/timesync/synchronized`：
+
+- `remote_daemon.py` 开机等它出现才放开 POWER。不设超时，用 `time.monotonic()` 计等待时长
+- `capture_linux.py` 每段开采前再查一次，拦的是不经守护进程直接跑脚本的情形
+
+等待期间 POWER 已经 grab 独占，按键不会漏给 logind。服务器配置、B 套部署、两套误差见
+[TIME_SYNC.md](TIME_SYNC.md)。
+
+### 落盘 SSD 预检（2026-10-19）
+
+`/mnt/pssd` 是 `x-systemd.automount,nofail`。SSD 不在时，第一次访问挂载点会让 systemd
+等设备 90 秒才报 `Errno 19`，这期间采集程序卡在 `os.makedirs` 里，ESC 也打断不了。
+10-19 晚两次共卡 3 分钟（实测）。
+
+`check_storage()` 先从 fstab 找出挂载点对应的设备（`UUID=` / `LABEL=` 等），
+再查 `/dev/disk/by-*/` 下的节点。这一步不经过 automount，节点不在最多等 10 秒就报
+`ssd_missing`。节点在、挂载那一刻掉线的 `ENODEV` 也归到同一句语音。
+
+守护进程启动时把 `/proc/device-tree/chosen/power/` 下的 `max_current`、PD 档位、`usb_max_current_enable`，以及
+`vcgencmd get_throttled` / `pmic_read_adc EXT5V_V` 写进日志，只记不播。
+10-20 读数：900 mA、PD 全 0、`0x50005`、4.600 V。
+
 ---
 
 ## 十、心率带 H10

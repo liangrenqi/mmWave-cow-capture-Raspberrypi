@@ -118,6 +118,7 @@ class Notifier:
 
     EVENTS = ("ready", "armed", "preparing", "start", "locked", "aborting",
               "finalizing", "done_good", "done_bad", "done_abort", "error",
+              "leftover", "ssd_missing",
               # 心率带 H10（h10_session.py 发出，2026-09-30 用户要求断线/重连都要播报）
               "h10_connected", "h10_lost", "h10_reconnected", "h10_missing")
 
@@ -146,6 +147,8 @@ class LogNotifier(Notifier):
         "done_bad":   "本段判定 BAD",
         "done_abort": "已中止，数据已归档",
         "error":      "出错",
+        "leftover":   "数据目录有上次残留文件，本次未采集",
+        "ssd_missing": "找不到移动硬盘，本次未采集",
         "h10_connected":   "心率带已连接",
         "h10_lost":        "心率带断开",
         "h10_reconnected": "心率带已重连",
@@ -176,6 +179,12 @@ class LogNotifier(Notifier):
         "done_bad":   "done_bad.wav",
         "done_abort": "done_abort.wav",
         "error":      "error.wav",
+        # leftover.wav - "发现残留文件，本次未采集"（2026-10-13 加：
+        # 残留检查拦下时原本静默，现场只听到就绪，会误判成雷达故障）
+        "leftover":   "leftover.wav",
+        # ssd_missing.wav - "找不到移动硬盘，本次未采集"（2026-10-19 加：
+        # 盘不在时原本要卡 3 分钟才播 error，现场以为命令没执行）
+        "ssd_missing": "ssd_missing.wav",
         # 心率带。录音建议：
         #   h10_connected.wav    - "心率带已连接"
         #   h10_lost.wav         - "心率带断开"

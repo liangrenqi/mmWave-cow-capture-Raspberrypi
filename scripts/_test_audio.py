@@ -20,7 +20,10 @@
   done_bad    两声下行（不妙）
   done_abort  一长一短
   error       快速三连低音
+  leftover    低音长鸣两声（发现残留文件，本次未采集）
+  ssd_missing 三声下行长音（找不到移动硬盘，本次未采集）
   h10_*       心率带四个事件，统一用最高音区（连接 / 断开 / 重连 / 未连接）
+  time_*      守护进程的开机校时闸门（等待中 / 校正完毕），低音区
 
 生成的 wav 是 16-bit PCM / 44.1 kHz / 单声道，aplay 直接支持。
 录真人语音时用同样格式覆盖同名文件即可，代码不用改。
@@ -98,6 +101,13 @@ PLACEHOLDER = {
     "error.wav":      lambda: (tone(300, 130) + silence(50)
                                + tone(300, 130) + silence(50)
                                + tone(300, 130)),
+    # 两声低音长鸣，比 error 慢、比 done_bad 平：不是故障，是"先清理再采"
+    "leftover.wav":   lambda: (tone(350, 400) + silence(120)
+                               + tone(350, 400)),
+    # 三声下行长音：与 leftover 的两声平音区分，同属"本次未采集"一类
+    "ssd_missing.wav": lambda: (tone(440, 300) + silence(100)
+                                + tone(370, 300) + silence(100)
+                                + tone(311, 450)),
 
     # ---- 守护进程用（remote_daemon.py）----
     # 与采集程序那套刻意区分开：程序级事件用**低音区**，
@@ -110,6 +120,13 @@ PLACEHOLDER = {
                                  + tone(233, 100) + silence(45)
                                  + tone(233, 100) + silence(45)
                                  + tone(233, 100)),
+    # 开机校时闸门（2026-10-19 加）。仍在低音区：属于程序级事件
+    # time_waiting 两声低音、间隔拉长（"还在等"）；time_synced 低到中的上行三声
+    "time_waiting.wav": lambda: (tone(294, 220) + silence(260)
+                                 + tone(294, 220)),
+    "time_synced.wav":  lambda: (tone(294, 120) + silence(50)
+                                 + tone(392, 120) + silence(50)
+                                 + tone(523, 200)),
 
     # ---- 心率带 H10（h10_session.py）----
     # 用**最高音区**（1300–2000 Hz 的短促音），与上面两套都区分开：
@@ -225,7 +242,7 @@ def main():
         "采集程序 capture_linux.py --remote（中高音区）",
         [(e, cap_map.get(e)) for e in
          ("preparing", "start", "done_good", "done_bad",
-          "done_abort", "error", "ready")])
+          "done_abort", "error", "leftover", "ssd_missing", "ready")])
 
     print()
     missing += play_group(
@@ -242,7 +259,8 @@ def main():
         missing += play_group(
             "守护进程 remote_daemon.py（低音区，与上面区分）",
             [(e, dmn_map.get(e)) for e in
-             ("daemon_ready", "app_starting", "app_exiting", "busy")])
+             ("time_waiting", "time_synced", "daemon_ready",
+              "app_starting", "app_exiting", "busy")])
     except Exception as e:
         print(f"  --- 守护进程音频（跳过：{e}）---")
 
