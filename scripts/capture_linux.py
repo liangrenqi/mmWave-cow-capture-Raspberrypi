@@ -121,7 +121,10 @@ H10_ENABLED = os.environ.get("CAPTURE_H10", "1").strip().lower() not in ("0", "n
 
 # 现场标注
 COW_ID = "UNKNOWN"
-CAPTURE_MODE = "vitalsigns"
+# 目录名、meta 的 mode=、横幅都用它，必须与实际波形一致：默认跟 MODE
+# （CAPTURE_CFG_MODE），main() 里再被 --mode 覆盖。原先照搬 Lua 版写死
+# "vitalsigns"，08-02 改 --mode 时漏了它，行为段目录也叫 *_vitalsigns_*。
+CAPTURE_MODE = MODE
 NOTE = ""
 # ==================================
 
@@ -1970,10 +1973,11 @@ def main():
     # 用 --mode 覆盖默认值。原先靠改 JSON_CFG/PROFILE_CFG 两个常量切换波形，
     # 那样改动会被下一次 scp 覆盖（2026-08-02 就这样丢过一次，导致对着
     # 记住了行为 chCfg 的雷达发妊娠 cfg，撞上 mmw_cli.c:288 的 debugAssert）。
-    global JSON_CFG, PROFILE_CFG
+    global JSON_CFG, PROFILE_CFG, CAPTURE_MODE
     if args.mode:
         JSON_CFG = os.path.join(CFG_DIR, f"dca1000_{args.mode}.json")
         PROFILE_CFG = os.path.join(CFG_DIR, f"cow_{args.mode}.cfg")
+        CAPTURE_MODE = args.mode
 
     jc = load_json_cfg()
     fc = parse_cfg(PROFILE_CFG)

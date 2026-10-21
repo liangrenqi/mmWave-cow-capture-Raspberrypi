@@ -6,6 +6,39 @@
 
 ---
 
+## 2026-10-21
+
+### 模式标签跟着 --mode 走
+
+**问题（读源码）**：
+- `CAPTURE_MODE = "vitalsigns"` 是写死的常量，`--mode` 和 `CAPTURE_CFG_MODE` 都改不动它。
+- 它用在 6 处：目录名 `Cow_*` / `ABORT_Cow_*`（BAD 段在此基础上加 `BAD_`）、两份 meta 的 `mode=`、启动横幅。
+- 所以行为段也被标成 vitalsigns。08-02 的行为满测目录就叫 `Cow_UNKNOWN_vitalsigns_20260802_132123_to_132623`。
+- 来源：照搬 Lua 版 `2_Trigger_Capture.lua` 的现场变量。08-02 把波形改成 `--mode` 时只接了 `JSON_CFG` / `PROFILE_CFG`，漏了它。
+
+**改法**：
+- 常量默认值改为 `MODE`（即 `CAPTURE_CFG_MODE`，缺省 behavior）。
+- `main()` 里 `--mode` 覆盖 `JSON_CFG` / `PROFILE_CFG` 的同时，也覆盖 `CAPTURE_MODE`。
+- 6 处引用都在运行时读全局变量，不用逐处改。
+
+**验证（实测，Pi 上，只跑到横幅，没有采集）**：
+
+| 入参 | cfg | 横幅模式 |
+|---|---|---|
+| 不带 | cow_behavior.cfg | behavior |
+| `--mode vitalsigns` | cow_vitalsigns.cfg | vitalsigns |
+| `--mode behavior` | cow_behavior.cfg | behavior |
+| `CAPTURE_CFG_MODE=vitalsigns` | cow_vitalsigns.cfg | vitalsigns |
+
+**未验证**：目录名与 meta 的 `mode=` 要等真采一段才能看到。
+
+**注意**：
+- 已采的旧目录不改名。旧段要区分模式，看 meta 的 `cfg_file` / `channel_cfg` / `frame_bytes`。
+- `remote_daemon.py` 的 `CAPTURE_ARGS` 仍是 `--mode vitalsigns`，切换方法照旧。
+- 服务要重启才会载入新代码。
+
+---
+
 ## 2026-10-20
 
 ### 校时服务器写成配置文件，B 套按它装
