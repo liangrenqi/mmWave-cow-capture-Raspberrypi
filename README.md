@@ -145,11 +145,11 @@ docs/               文档
 | `remote_daemon.py` | 开机自启的守护进程：记录供电、等 NTP 校时，之后 POWER × 2 启停采集程序 |
 | `remote_control.py` | 采集程序内的遥控状态机与语音后端（ENTER × 2 采一段、ESC 中止） |
 | `probe_radar.py` | 雷达存活探针。0 字节即固件没跑，此时任何 cfg 结果都不可信 |
-| `verify_pcap_bin.py` | L3 逐字节比对（pcap 重排后 ≡ bin），流式、跨分片 |
+| `verify_pcap_bin.py` | L3 逐字节比对（pcap 重排后 ≡ bin），流式、跨分片；分片按数字序拼接、编号须连续 |
 | `check_quality.py` | RX 通道死活检测。四层判据唯一测不出的静默故障 |
 | `send_cfg_only.py` | 只发 cfg 不碰采集卡，用于验证 `sensorStart`。含 L3 占用预测 |
 | `pcap_to_bin.py` | pcap → bin 转换（含 lane 重排），封盒后纯 pcap 方案的后处理 |
-| `_test_*.py` | 自检脚本：音频、按键、输入设备、H10 会话（离线假 logger） |
+| `_test_*.py` | 自检脚本：音频、按键、输入设备、H10 会话（离线假 logger）、L3 分片排序（离线合成数据） |
 
 ## 文档
 

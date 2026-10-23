@@ -26,6 +26,7 @@ import array
 import glob
 import hashlib
 import os
+import re
 import struct
 import sys
 import time
@@ -53,6 +54,31 @@ def reorder(buf):
     return out.tobytes()
 
 
+def sorted_bins(session_dir):
+    """按 _Raw_<N>.bin 的数字排序，并要求编号从 0 起连续
+
+    不能用 sorted(glob)：字典序在 N >= 10 时会把 _Raw_10 排到 _Raw_2 前面，
+    从第 3 片起整段错位。2026-10-23 30 分钟行为段 13 片，就因此把逐字节
+    完全一致的数据判成 BAD（首个差异 = 2 × 1,073,741,760，正好是第 3 片起点）。
+    编号缺一片也会静默错位，同样拦下。与 pcap_to_bin.sorted_bins 同一规则。
+    """
+    paths = glob.glob(os.path.join(session_dir, "*_Raw_*.bin"))
+    if not paths:
+        sys.exit(f"[ERROR] {session_dir} 下没有 _Raw_*.bin")
+
+    def idx(p):
+        m = re.search(r"_Raw_(\d+)\.bin$", os.path.basename(p))
+        if not m:
+            sys.exit(f"[ERROR] 文件名不符合 _Raw_<N>.bin: {p}")
+        return int(m.group(1))
+
+    out = sorted(paths, key=idx)
+    got = [idx(p) for p in out]
+    if got != list(range(len(got))):
+        sys.exit(f"[ERROR] 分片编号不连续: {got} —— 缺文件会导致静默错位")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("session")
@@ -61,11 +87,9 @@ def main():
 
     d = args.session
     pcaps = sorted(glob.glob(os.path.join(d, "*.pcap")))
-    bins = sorted(glob.glob(os.path.join(d, "*_Raw_*.bin")))
     if not pcaps:
         sys.exit(f"[ERROR] {d} 下没有 .pcap")
-    if not bins:
-        sys.exit(f"[ERROR] {d} 下没有 _Raw_*.bin")
+    bins = sorted_bins(d)
 
     pcap_path = pcaps[0]
     bin_total = sum(os.path.getsize(b) for b in bins)
